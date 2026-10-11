@@ -326,6 +326,22 @@ public:
    * here would report an unverified rollback for a port nothing touched. */
   virtual bool ClearStationIdentity() { return true; }
 
+  /* --- Receive side of a block-ack session ---------------------------------
+   *
+   * After SetStationIdentity: has the MAC answer `peer`'s A-MPDUs on `tid`
+   * with BlockAcks, its window starting at `ssn`. The caller still answers
+   * the ADDBA request itself and puts what arrives back in order. One session
+   * at a time; a second call replaces the first. */
+  virtual bool AcceptBlockAck(const devourer::MacAddr &peer, uint8_t tid,
+                              uint16_t ssn, uint16_t buffer_size) {
+    (void)peer;
+    (void)tid;
+    (void)ssn;
+    (void)buffer_size;
+    return false;
+  }
+  virtual bool EndBlockAck() { return true; }
+
   /* 802.11 A-MPDU TX mode (src/AmpduMode.h): the first-class bundle of the
    * recipe the spike + pacing sweep proved on-air. When enabled, every data
    * frame is marked aggregatable (data QSEL + AGG_EN + MAX_AGG_NUM +

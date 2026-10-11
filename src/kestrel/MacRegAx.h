@@ -676,6 +676,20 @@ constexpr uint8_t FWCMD_H2C_FUNC_ADDRCAM_INFO = 0x0;
 constexpr uint8_t FWCMD_H2C_CL_FR_EXCHG = 0x5;
 constexpr uint8_t FWCMD_H2C_FUNC_CCTLINFO_UD = 0x2;
 constexpr uint8_t FWCMD_H2C_FUNC_DCTLINFO_UD = 0x1;
+/* BA CAM: CAT_MAC, CL_BA_CAM(0xc), FUNC_BA_CAM(0). Two dwords, in the layout
+ * rtw89 sends the 8852C (rtw89_h2c_ba_cam, RTW89_BACAM_V0_EXT). */
+constexpr uint8_t FWCMD_H2C_CL_BA_CAM = 0xC;
+constexpr uint8_t FWCMD_H2C_FUNC_BA_CAM = 0x0;
+constexpr uint32_t H2C_BA_CAM_W0_VALID = 1u << 0;
+constexpr uint32_t H2C_BA_CAM_W0_INIT_REQ = 1u << 1;
+constexpr uint8_t H2C_BA_CAM_W0_TID_SH = 4;
+constexpr uint8_t H2C_BA_CAM_W0_MACID_SH = 8;
+constexpr uint8_t H2C_BA_CAM_W0_BMAP_SIZE_SH = 16;
+constexpr uint8_t H2C_BA_CAM_W0_SSN_SH = 20;
+constexpr uint32_t H2C_BA_CAM_W1_STD_EN = 1u << 8;
+constexpr uint8_t H2C_BA_CAM_W1_ENTRY_IDX_SH = 28;
+/* Bitmap size code for a window above 64 frames; 0 serves up to 64. */
+constexpr uint32_t H2C_BA_CAM_BMAP_OVER_64 = 4;
 
 /* addr_cam entry geometry (addr_cam.h get_addr_cam_size): 8852A/8852B/8851B
  * use the LONG entry, every later chip including the 8852C the SHORT one. */

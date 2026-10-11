@@ -861,14 +861,36 @@ bool RtlKestrelDevice::SetStationIdentity(const devourer::MacAddr &own,
     return false;
   }
   _station_identity = _hal.set_station_identity(own.data(), bssid.data());
+  _own = own;
+  _bssid = bssid;
   return _station_identity;
 }
 
 bool RtlKestrelDevice::ClearStationIdentity() {
   if (!_station_identity)
     return true;
+  EndBlockAck();
   _station_identity = false;
   return _hal.clear_station_identity(kInjectSA);
+}
+
+bool RtlKestrelDevice::AcceptBlockAck(const devourer::MacAddr &peer,
+                                      uint8_t tid, uint16_t ssn,
+                                      uint16_t buffer_size) {
+  if (!_station_identity) {
+    _logger->error("Kestrel: AcceptBlockAck needs SetStationIdentity first");
+    return false;
+  }
+  _block_ack = _hal.accept_block_ack(_own.data(), _bssid.data(), peer.data(),
+                                     tid, ssn, buffer_size);
+  return _block_ack;
+}
+
+bool RtlKestrelDevice::EndBlockAck() {
+  if (!_block_ack)
+    return true;
+  _block_ack = false;
+  return _hal.end_block_ack();
 }
 
 bool RtlKestrelDevice::ConfigureTwt(const devourer::TwtConfig &cfg) {

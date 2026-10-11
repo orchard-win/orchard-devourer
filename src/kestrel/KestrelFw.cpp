@@ -425,13 +425,16 @@ uint8_t KestrelFw::addr_cam_entry_size() const {
 
 bool KestrelFw::fw_upd_addr_cam(uint8_t macid, const uint8_t self_mac[6],
                                 uint8_t net_type, uint8_t addr_cam_idx,
-                                uint8_t bssid_cam_idx, const uint8_t *bssid) {
+                                uint8_t bssid_cam_idx, const uint8_t *bssid,
+                                const uint8_t *peer) {
   /* fill_addr_cam_info + fill_bssid_cam_info (addr_cam.c). 15-dword body
    * (fwcmd_addrcam_info): dword0 and dword7 are reserved. mask_sel = NO_MSK,
    * so both hashes are the full-6-byte XOR. Without `bssid` the entry is the
    * self/NO_LINK STA one, bssid = tma = self_mac; with it, tma follows the
-   * BSSID as in rtw89_cam_fill_addr_cam_info. */
-  const uint8_t *tma = bssid ? bssid : self_mac;
+   * BSSID as in rtw89_cam_fill_addr_cam_info, unless `peer` names the station
+   * on the other end. */
+  const uint8_t *bss = bssid ? bssid : self_mac;
+  const uint8_t *tma = peer ? peer : bss;
   uint8_t sma_hash = 0, tma_hash = 0;
   for (int i = 0; i < 6; i++) {
     sma_hash ^= self_mac[i];
@@ -469,16 +472,43 @@ bool KestrelFw::fw_upd_addr_cam(uint8_t macid, const uint8_t self_mac[6],
   /* dword13: b_valid / b_msk / bss_color / bssid[0..1] */
   put_le32(c + 52, 0x1u /* B_VALID BIT(0) */ |
                        sw(r::BSSID_CAM_MATCH_ALL, 0x3f, 2) | sw(0, 0x3f, 8) |
-                       sw(tma[0], 0xff, 16) | sw(tma[1], 0xff, 24));
+                       sw(bss[0], 0xff, 16) | sw(bss[1], 0xff, 24));
   /* dword14: bssid[2..5] */
-  put_le32(c + 56, sw(tma[2], 0xff, 0) | sw(tma[3], 0xff, 8) |
-                       sw(tma[4], 0xff, 16) | sw(tma[5], 0xff, 24));
+  put_le32(c + 56, sw(bss[2], 0xff, 0) | sw(bss[3], 0xff, 8) |
+                       sw(bss[4], 0xff, 16) | sw(bss[5], 0xff, 24));
   bool ok = send_h2c_cmd(r::FWCMD_H2C_CAT_MAC, r::FWCMD_H2C_CL_ADDR_CAM_UPDATE,
                          r::FWCMD_H2C_FUNC_ADDRCAM_INFO, c, sizeof(c));
   _logger->info("Kestrel: upd_addr_cam (macid={} net_type={} a_idx={} b_idx={} "
                 "sma={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}) -> {}",
                 macid, net_type, addr_cam_idx, bssid_cam_idx, self_mac[0],
                 self_mac[1], self_mac[2], self_mac[3], self_mac[4], self_mac[5],
+                ok ? "sent" : "FAILED");
+  return ok;
+}
+
+bool KestrelFw::fw_ba_cam(uint8_t macid, uint8_t tid, uint16_t ssn,
+                          uint16_t buffer_size, uint8_t entry_idx, bool valid) {
+  /* A closing command carries the macid and the entry index only. INIT_REQ
+   * has the hardware start its window at `ssn`; STD_EN marks a static entry. */
+  uint32_t w0 = static_cast<uint32_t>(macid) << r::H2C_BA_CAM_W0_MACID_SH;
+  uint32_t w1 = static_cast<uint32_t>(entry_idx & 0xf)
+                << r::H2C_BA_CAM_W1_ENTRY_IDX_SH;
+  if (valid) {
+    const uint32_t bmap = buffer_size > 64 ? r::H2C_BA_CAM_BMAP_OVER_64 : 0;
+    w0 |= r::H2C_BA_CAM_W0_VALID | r::H2C_BA_CAM_W0_INIT_REQ |
+          (static_cast<uint32_t>(tid & 0xf) << r::H2C_BA_CAM_W0_TID_SH) |
+          (bmap << r::H2C_BA_CAM_W0_BMAP_SIZE_SH) |
+          (static_cast<uint32_t>(ssn & 0xfff) << r::H2C_BA_CAM_W0_SSN_SH);
+    w1 |= r::H2C_BA_CAM_W1_STD_EN;
+  }
+  uint8_t c[8];
+  put_le32(c + 0, w0);
+  put_le32(c + 4, w1);
+  const bool ok = send_h2c_cmd(r::FWCMD_H2C_CAT_MAC, r::FWCMD_H2C_CL_BA_CAM,
+                               r::FWCMD_H2C_FUNC_BA_CAM, c, sizeof(c));
+  _logger->info("Kestrel: ba_cam (macid={} tid={} ssn={} buf={} entry={} "
+                "valid={}) -> {}",
+                macid, tid, ssn, buffer_size, entry_idx, valid,
                 ok ? "sent" : "FAILED");
   return ok;
 }

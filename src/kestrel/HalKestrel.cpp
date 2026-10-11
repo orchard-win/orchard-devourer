@@ -1614,6 +1614,22 @@ bool HalKestrel::set_station_identity(const uint8_t own[6],
   return ok;
 }
 
+bool HalKestrel::accept_block_ack(const uint8_t own[6], const uint8_t bssid[6],
+                                  const uint8_t peer[6], uint8_t tid,
+                                  uint16_t ssn, uint16_t buffer_size) {
+  namespace r = kestrel::reg;
+  const bool named =
+      _fw.fw_upd_addr_cam(/*macid=*/0, own, r::MAC_AX_NET_TYPE_ADHOC,
+                          /*addr_cam_idx=*/0, /*bssid_cam_idx=*/0, bssid, peer);
+  return _fw.fw_ba_cam(/*macid=*/0, tid, ssn, buffer_size, /*entry_idx=*/0,
+                       /*valid=*/true) &&
+         named;
+}
+
+bool HalKestrel::end_block_ack() {
+  return _fw.fw_ba_cam(/*macid=*/0, 0, 0, 0, /*entry_idx=*/0, /*valid=*/false);
+}
+
 bool HalKestrel::clear_station_identity(const uint8_t inject_sa[6]) {
   namespace r = kestrel::reg;
   const bool ok =

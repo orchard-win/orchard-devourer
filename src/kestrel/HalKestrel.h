@@ -294,6 +294,12 @@ public:
   bool set_station_identity(const uint8_t own[6], const uint8_t bssid[6]);
   /* Back to `inject_sa` with no link, sniffer mode and the Bluetooth wait. */
   bool clear_station_identity(const uint8_t inject_sa[6]);
+  /* After set_station_identity: names `peer` in the address CAM entry of
+   * macid 0 and opens a BA CAM entry for its A-MPDUs on `tid`. */
+  bool accept_block_ack(const uint8_t own[6], const uint8_t bssid[6],
+                        const uint8_t peer[6], uint8_t tid, uint16_t ssn,
+                        uint16_t buffer_size);
+  bool end_block_ack();
 
   /* ---- 802.11ax scheduled-UL levers (KestrelFwSched.cpp encoders) ---- */
 

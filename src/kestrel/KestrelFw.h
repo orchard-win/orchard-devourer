@@ -77,7 +77,14 @@ public:
    * this entry; without it the CMAC cannot build the PPDU. */
   bool fw_upd_addr_cam(uint8_t macid, const uint8_t self_mac[6], uint8_t net_type,
                        uint8_t addr_cam_idx, uint8_t bssid_cam_idx,
-                       const uint8_t *bssid = nullptr);
+                       const uint8_t *bssid = nullptr,
+                       const uint8_t *peer = nullptr);
+
+  /* rtw89_fw_h2c_ba_cam: opens (or with `valid` false closes) the entry that
+   * makes the MAC answer `macid`'s A-MPDUs on `tid` with BlockAcks, its window
+   * starting at `ssn`. 8852C layout only. */
+  bool fw_ba_cam(uint8_t macid, uint8_t tid, uint16_t ssn, uint16_t buffer_size,
+                 uint8_t entry_idx, bool valid);
 
   /* mac_upd_cctl_info (tblupd.c): H2C cat=MAC, class=FR_EXCHG, func=CCTLINFO_UD
    * — the per-MACID CMAC control table. Sets the default TX rate, the TX

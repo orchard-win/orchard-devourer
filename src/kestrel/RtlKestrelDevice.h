@@ -179,8 +179,14 @@ public:
   bool SetStationIdentity(const devourer::MacAddr &own,
                           const devourer::MacAddr &bssid) override;
   bool ClearStationIdentity() override;
+  /* Untested on air as of 2026-10-11: see HalKestrel::accept_block_ack. */
+  bool AcceptBlockAck(const devourer::MacAddr &peer, uint8_t tid, uint16_t ssn,
+                      uint16_t buffer_size) override;
+  bool EndBlockAck() override;
   int _bcn_interval_tu = 0; /* >0 while a HW beacon is armed (StartBeacon) */
   bool _station_identity = false; /* SetStationIdentity is in effect */
+  devourer::MacAddr _own, _bssid; /* what SetStationIdentity was given */
+  bool _block_ack = false;        /* AcceptBlockAck is in effect */
 
   /* 802.11ax scheduled UL: air an HE Basic Trigger (UL-OFDMA grant), program
    * TWT agreements + STA binds, and the fw-autonomous trigger cadence
