@@ -179,7 +179,7 @@ public:
   bool SetStationIdentity(const devourer::MacAddr &own,
                           const devourer::MacAddr &bssid) override;
   bool ClearStationIdentity() override;
-  /* Untested on air as of 2026-10-11: see HalKestrel::accept_block_ack. */
+  /* The 8852C over PCIe, one peer and TID: HalKestrel::accept_block_ack. */
   bool AcceptBlockAck(const devourer::MacAddr &peer, uint8_t tid, uint16_t ssn,
                       uint16_t buffer_size) override;
   bool EndBlockAck() override;

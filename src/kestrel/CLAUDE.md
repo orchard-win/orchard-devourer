@@ -350,6 +350,20 @@ Two address CAM facts corrected on the way (vendor `get_addr_cam_size`, rtw89
 0x3f, one bit per byte to compare. `fw_upd_addr_cam` sent the 8852B's 0x40 and
 a mask of 0 before.
 
+## Receiving under block ack (8852C over PCIe)
+
+`AcceptBlockAck(peer, tid, ssn, buffer)` after `SetStationIdentity` has the MAC
+answer that peer's A-MPDUs with BlockAcks (`HalKestrel::accept_block_ack`). It
+re-sends the address CAM entry of macid 0 with `peer` as its TMA, the BSSID CAM
+keeping the BSSID, then `fw_ba_cam`: rtw89's `rtw89_fw_h2c_ba_cam` in the
+V0_EXT layout (static entry 0, STD_EN, INIT_REQ with the request's starting
+sequence number). The caller answers the ADDBA request itself. Measured on one
+RTL8852CE against an iPhone on channel 44, 20 MHz: after one ADDBA exchange
+the iPhone sent a BAR and then aggregates of 9.4 frames on average behind
+RTS; 47 of 20,414 data frames carried the retry flag, none arrived twice, 9
+arrived out of order. Not tried: a window above 64, a second TID or peer,
+DELBA, whether naming the peer in the address CAM is needed at all.
+
 ## Scope
 
 The capstone is 11ax trigger-based UL + TWT (issue #236 — the v1.19 vendor
