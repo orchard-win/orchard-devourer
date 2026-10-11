@@ -53,6 +53,13 @@ constexpr uint32_t BMC = 1u << 11;         /* wd_info dword1: broadcast/multicas
  * is not ported here either. */
 constexpr uint32_t DATA_TXCNT_LMT_SEL = 1u << 31; /* wd_info dword1 */
 constexpr uint8_t DATA_TXCNT_LMT_SH = 25;         /* wd_info dword1 [30:25] */
+/* A-MPDU formation, as rtw89 fills it for a frame of a block-ack session
+ * (RTW89_TXWD_BODY0_HDR_LLC_LEN, BODY3_AGG_EN, INFO1_MAX_AGGNUM,
+ * INFO2_AMPDU_DENSITY). */
+constexpr uint8_t HDR_LLC_LEN_SH = 11;   /* wd_body dword0 [15:11], 2-byte units */
+constexpr uint32_t AGG_EN = 1u << 12;    /* wd_body dword3 */
+constexpr uint8_t MAX_AGGNUM_SH = 0;     /* wd_info dword1 [7:0], MPDUs - 1 */
+constexpr uint8_t AMPDU_DENSITY_SH = 18; /* wd_info dword2 [20:18] */
 } /* namespace txd */
 
 /* Map a devourer MGN_* rate (RateDefinitions.h) to the AX_TXD_DATARATE encoding
@@ -224,6 +231,13 @@ inline std::vector<uint8_t> build_mgnt_txdesc(const uint8_t *frame,
 
 constexpr uint8_t MAC_AX_DATA_CH0 = 0; /* AC0 (best-effort) DMA channel */
 
+/* What marks a data frame as one the MAC may put in an A-MPDU. */
+struct TxAggregate {
+  uint8_t max_mpdus = 0;  /* per A-MPDU, 1..256 as the peer's window allows */
+  uint8_t density = 0;    /* 802.11 minimum MPDU start spacing code, 0..7 */
+  uint8_t header_len = 0; /* of the 802.11 header, bytes */
+};
+
 /* Build the AX data-frame TX descriptor (txdes_proc_data_8852b), best-effort
  * (TID 0 -> qsel 0, band 0, wmm 0, no security / aggregation / shortcut).
  * Differs from the mgmt path only in wd_body dword0 CH_DMA=DATA_CH0 and dword2
@@ -235,12 +249,18 @@ inline std::vector<uint8_t> build_data_txdesc(const uint8_t *frame,
                                               uint16_t seq,
                                               uint32_t wd_body_len = WD_BODY_LEN,
                                               int txcnt_lmt = -1,
-                                              bool stf_mode = true) {
+                                              bool stf_mode = true,
+                                              const TxAggregate *aggregate = nullptr) {
   const uint32_t txd_len = wd_body_len + WD_INFO_LEN;
   std::vector<uint8_t> buf(txd_len + frame_len, 0);
   uint8_t *wd = buf.data();
-  /* dword0: [STF_MODE] | CH_DMA=DATA_CH0(0) | WDINFO_EN (STF = USB only). */
+  /* dword0: [STF_MODE] | CH_DMA=DATA_CH0(0) | WDINFO_EN (STF = USB only),
+   * and for an aggregatable frame the header length rtw89 gives every
+   * frame. */
+  const uint32_t header_units =
+      aggregate ? (aggregate->header_len / 2u) & 0x1f : 0u;
   txd_put_le32(wd + 0, (stf_mode ? txd::STF_MODE : 0u) | txd::WDINFO_EN |
+                           (header_units << txd::HDR_LLC_LEN_SH) |
                            (static_cast<uint32_t>(MAC_AX_DATA_CH0)
                             << txd::CH_DMA_SH));
   /* dword1 = shcut_camid = 0 */
@@ -248,11 +268,22 @@ inline std::vector<uint8_t> build_data_txdesc(const uint8_t *frame,
   txd_put_le32(wd + 8,
                (static_cast<uint32_t>(frame_len & 0x3fff) << txd::TXPKTSIZE_SH) |
                    (static_cast<uint32_t>(macid & 0x7f) << txd::MACID_SH));
-  /* dword3: WIFI_SEQ (no ampdu_en). */
-  txd_put_le32(wd + 12, static_cast<uint32_t>(seq & 0xfff) << txd::WIFI_SEQ_SH);
-  /* wd_info dword1: BMC + per-frame TX-count limit (same as mgmt). */
-  if (const uint32_t d1 = wd_info_dword1(frame, frame_len, txcnt_lmt))
+  /* dword3: WIFI_SEQ, which for an aggregatable frame has to be the frame's
+   * own sequence number: the MAC reads the block ack against it. */
+  txd_put_le32(wd + 12,
+               (static_cast<uint32_t>(seq & 0xfff) << txd::WIFI_SEQ_SH) |
+                   (aggregate ? txd::AGG_EN : 0u));
+  /* wd_info dword1: BMC + per-frame TX-count limit (same as mgmt), and how
+   * many MPDUs an A-MPDU may hold. */
+  uint32_t d1 = wd_info_dword1(frame, frame_len, txcnt_lmt);
+  if (aggregate && aggregate->max_mpdus)
+    d1 |= static_cast<uint32_t>(aggregate->max_mpdus - 1) << txd::MAX_AGGNUM_SH;
+  if (d1)
     txd_put_le32(wd + wd_body_len + 4, d1);
+  if (aggregate)
+    txd_put_le32(wd + wd_body_len + 8,
+                 static_cast<uint32_t>(aggregate->density & 0x7)
+                     << txd::AMPDU_DENSITY_SH);
   /* Rate fields: same split as mgmt (V1 -> wd_body dword7, else wd_info d0). */
   put_txdesc_rate(wd, wd_body_len, r);
   std::memcpy(wd + txd_len, frame, frame_len);

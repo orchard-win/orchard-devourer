@@ -574,6 +574,16 @@ void RtlKestrelDevice::SetTxMode(const devourer::TxMode &mode) {
 }
 void RtlKestrelDevice::ClearTxMode() { _tx_mode_default.reset(); }
 
+bool RtlKestrelDevice::SetAmpduMode(const devourer::AmpduMode &mode) {
+  /* TID 0 is the one queue send_packet puts data frames on. */
+  if (mode.enabled && mode.tid != 0)
+    return false;
+  _ampdu_mode = mode;
+  return true;
+}
+void RtlKestrelDevice::ClearAmpduMode() { _ampdu_mode = {}; }
+devourer::AmpduMode RtlKestrelDevice::GetAmpduMode() { return _ampdu_mode; }
+
 devourer::ThermalStatus RtlKestrelDevice::GetThermalStatus() {
   devourer::ThermalStatus s;
   s.raw = _hal.read_thermal(/*path=*/0); /* RF path A */
@@ -1293,7 +1303,25 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
                  : _cfg.tx.retry_limit > 62 ? 62
                                             : _cfg.tx.retry_limit;
   const int txcnt = rl + 1;
-  auto buf = use_data_q
+  /* An A-MPDU holds QoS data frames to one station. Such a frame goes out
+   * under its own sequence number, not the rolling one. */
+  constexpr uint32_t kQosDataHeaderLen = 26;
+  constexpr uint8_t kFrameControlQosData = 0x88;
+  const bool aggregatable =
+      _ampdu_mode.enabled && use_data_q && flen > kQosDataHeaderLen &&
+      frame[0] == kFrameControlQosData && !(frame[4] & 0x01) &&
+      (frame[24] & 0x0f) == _ampdu_mode.tid;
+  kestrel::TxAggregate aggregate;
+  aggregate.max_mpdus = _ampdu_mode.max_num;
+  aggregate.density = _ampdu_mode.density;
+  aggregate.header_len = static_cast<uint8_t>(kQosDataHeaderLen);
+  const uint16_t own_seq =
+      aggregatable ? static_cast<uint16_t>((frame[22] | frame[23] << 8) >> 4)
+                   : 0;
+  auto buf = aggregatable
+                 ? kestrel::build_data_txdesc(frame, flen, tr, 0, own_seq,
+                                              wd_len, txcnt, stf, &aggregate)
+             : use_data_q
                  ? kestrel::build_data_txdesc(frame, flen, tr, 0,
                                               _tx_seq++ & 0xfff, wd_len, txcnt,
                                               stf)

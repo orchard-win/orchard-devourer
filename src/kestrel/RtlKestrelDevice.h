@@ -128,6 +128,15 @@ public:
   void SetTxMode(const devourer::TxMode &mode) override;
   void ClearTxMode() override;
 
+  /* A-MPDU formation for a station session's block-ack agreement, on TID 0
+   * only. Unlike the 11ac backends it marks nothing but unicast QoS data
+   * frames of that TID, each under its own sequence number, and has no
+   * pacing half; `no_ack` is ignored, the session's retry limit holds. The
+   * caller makes the agreement (ADDBA) and numbers the frames. */
+  bool SetAmpduMode(const devourer::AmpduMode &mode) override;
+  void ClearAmpduMode() override;
+  devourer::AmpduMode GetAmpduMode() override;
+
   /* 64-bit free-running MAC TSF (band-0 port-0). mac_get_tsf (twt.c). */
   uint64_t ReadTsf() override;
 
@@ -292,6 +301,7 @@ private:
   bool _tx_data_ok = false; /* data frames may use _tx_data_q */
   uint16_t _tx_seq = 0;    /* rolling 12-bit wifi sequence for injected frames */
   std::optional<devourer::TxMode> _tx_mode_default; /* SetTxMode default */
+  devourer::AmpduMode _ampdu_mode;                  /* SetAmpduMode */
   int16_t _sess_pwr_qdb = 0; /* offset applied by SetTxPowerOffsetQdb — the
                               * restore target for frames without a radiotap
                               * DBM_TX_POWER field */

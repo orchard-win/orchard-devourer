@@ -394,7 +394,21 @@ not found, so a 40 MHz HT frame from an 80 MHz tuning is unproven at best.
 The PCIe release reports say what became of each frame, and
 `TxStats::reported` / `given_up` now carry their totals (`GetTxStats`); the
 caller that picks a rate from them has to discount frames lost while the
-peer was off the channel. No TX A-MPDU exists on this generation.
+peer was off the channel.
+
+`SetAmpduMode` (TID 0 only) makes the MAC aggregate: unicast QoS data frames
+of that TID get `AGG_EN` (wd_body dword3 bit 12), `MAX_AGGNUM` (wd_info
+dword1 [7:0], MPDUs minus one), `AMPDU_DENSITY` (wd_info dword2 [20:18]) and
+`HDR_LLC_LEN`, and the descriptor's sequence number becomes the frame's own
+instead of the rolling one: the MAC reads block acks against it. The caller
+makes the agreement (ADDBA) and numbers the frames. Same card and phone as
+above, with the fixed VHT rate: aggregates formed at once, up to 1,568
+frames in 200 ms. The MAC does not tell the receiver when it gives up on an
+MPDU. Without a block-ack request from the host that moves the receiver's
+window, each agreement stalled within two seconds and the phone ended it;
+with one, a 24.5 MB transfer ran under a single agreement at 4.7 MB/s. A
+block ack covered 2.6 MPDUs on average, far below the 64 allowed, cause not
+found. One card, one peer, one run of each.
 
 ## Scope
 
