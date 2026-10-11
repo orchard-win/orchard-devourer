@@ -364,6 +364,20 @@ RTS; 47 of 20,414 data frames carried the retry flag, none arrived twice, 9
 arrived out of order. Not tried: a window above 64, a second TID or peer,
 DELBA, whether naming the peer in the address CAM is needed at all.
 
+## A station on a 40 MHz channel (8852C over PCIe)
+
+`set_channel` tunes the RF and the BB only. `set_station_identity` therefore
+also runs `set_channel_mac`, rtw8852c_set_channel_mac's three writes: the
+width in `R_AX_WMAC_RFMOD`, where a narrower frame sits in
+`R_AX_TX_SUB_CARRIER_VALUE` (`TxSubChannel.h`, rtw89_phy_get_txsc's codes),
+and the band's rate checks in `R_AX_TXRATE_CHK`. Measured on one RTL8852CE on
+channel 44 at 40 MHz against an iPhone: its 40 MHz HT MCS 15 A-MPDUs were
+received at 37 us a frame (90 at 20 MHz), 1% with the retry flag, while our
+20 MHz legacy frames and the MAC's own CTS, ACK and BlockAck reached it. Not
+separated: which of the three writes that takes, since 40 MHz was never run
+without them. `RxAtrib.bw` read 0 for those frames. 80 MHz is coded and
+unmeasured; monitor and injection sessions do not go through this.
+
 ## Scope
 
 The capstone is 11ax trigger-based UL + TWT (issue #236 — the v1.19 vendor
