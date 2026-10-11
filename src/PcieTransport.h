@@ -80,6 +80,16 @@ public:
     bool tx_quick_submit = false;
   };
 
+  /* With tx_quick_submit, leaves out even the write of the ring index: frames
+   * are queued in the ring and the chip is told of all of them by the next
+   * tx_kick(). The caller that defers owes that call before it waits for
+   * anything; until then the chip sends none of them. Firmware commands are
+   * never deferred. One sending thread only. */
+  void set_tx_kick_deferred(bool deferred);
+  /* Tells the chip of the frames queued since the last call. Returns whether
+   * there were any. */
+  bool tx_kick();
+
   /* Open the device at `bdf` ("0000:01:00.0"). Returns null and logs on any
    * failure (group not viable, BAR2 map failed, DMA map failed, no DMA plane
    * for this device id...). Under vfio, bus mastering + ASPM-off +

@@ -88,6 +88,8 @@ public:
   };
   RppStats rpp_stats() const;
   void add_tx_reports(TxStats &stats) const override;
+  void set_tx_kick_deferred(bool deferred) override;
+  bool tx_kick() override;
 
 private:
   struct TxRing {
@@ -95,6 +97,7 @@ private:
     uint64_t bd_iova = 0;
     uint32_t wp = 0;
     uint32_t hw_seen = 0; /* the hardware index when it was last read */
+    uint32_t told = 0;    /* the write index the chip was last given */
     uint16_t reg_num = 0, reg_idx = 0, reg_bdram = 0, reg_desa_l = 0;
     uint32_t bdram = 0;
   };
@@ -124,6 +127,7 @@ private:
   Logger_t _logger;
   int _rx_poll_us;
   bool _quick_submit; /* PcieTransport::Config::tx_quick_submit */
+  std::atomic<bool> _kick_deferred{false};
 
   std::array<TxRing, kTxChannels> _tx{};
   RxRing _rxq{}, _rpq{};

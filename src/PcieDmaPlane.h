@@ -86,6 +86,11 @@ public:
   virtual int tx_submit(uint8_t hint, uint8_t *buf, size_t len,
                         int timeout_ms) = 0;
 
+  /* PcieTransport::set_tx_kick_deferred and tx_kick, on a plane that can
+   * queue frames without telling the chip. */
+  virtual void set_tx_kick_deferred(bool) {}
+  virtual bool tx_kick() { return false; }
+
   /* Adds what the chip reported about sent frames (TxStats::reported and
    * given_up) on a plane whose bus carries such reports. */
   virtual void add_tx_reports(TxStats &) const {}

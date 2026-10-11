@@ -148,6 +148,12 @@ int PcieTransport::tx_sync(uint8_t ep, uint8_t *buf, size_t len,
   return rc;
 }
 
+void PcieTransport::set_tx_kick_deferred(bool deferred) {
+  if (_dma) _dma->set_tx_kick_deferred(deferred);
+}
+
+bool PcieTransport::tx_kick() { return _dma && _dma->tx_kick(); }
+
 devourer::TxStats PcieTransport::tx_stats() const {
   devourer::TxStats s;
   s.submitted = _tx_submitted.load(std::memory_order_relaxed);

@@ -423,6 +423,13 @@ transfer ran at 11.8 MB/s on the air, 13.9 MPDUs per A-MPDU, peaks of 3,545
 frames in 200 ms. One card, one peer, one run of each; under vfio, where an
 access is a memory write, the switch is unmeasured.
 
+`PcieTransport::set_tx_kick_deferred` drops that write as well: frames stay
+in the ring until `tx_kick()`, which the caller owes before it waits for
+anything. With a kick per 7 to 9 frames the MAC built aggregates of 33 to 35
+MPDUs and a 144.5 MB transfer ran at 16.3 MB/s on the air, 40 MB/s in the
+spans the peer was on the channel throughout. The frames the MAC holds when
+the peer leaves the channel are still given up on.
+
 ## Scope
 
 The capstone is 11ax trigger-based UL + TWT (issue #236 — the v1.19 vendor

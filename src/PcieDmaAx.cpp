@@ -211,6 +211,7 @@ bool PcieDmaAx::attach(const DmaSlab &dma) {
     r.bd_iova = dma.iova(off);
     r.wp = 0;
     r.hw_seen = 0;
+    r.told = 0;
     r.reg_num = kTxCh[ch].num;
     r.reg_idx = kTxCh[ch].idx;
     r.reg_bdram = kTxCh[ch].bdram;
@@ -287,6 +288,7 @@ void PcieDmaAx::setup_rings() {
     TxRing &r = _tx[ch];
     r.wp = 0;
     r.hw_seen = 0;
+    r.told = 0;
     _t.mmio_write<uint16_t>(r.reg_num, static_cast<uint16_t>(kBdLen & IDX_MASK));
     _t.mmio_write<uint32_t>(r.reg_bdram, r.bdram);
     write_ring_base(r.reg_desa_l, r.bd_iova);
@@ -495,7 +497,11 @@ int PcieDmaAx::submit_wd(int ch, uint8_t *buf, size_t len, int timeout_ms) {
            static_cast<uint16_t>(page_len), TXBD_OPTION_LS, pg_iova);
   std::atomic_thread_fence(std::memory_order_seq_cst);
   r.wp = (r.wp + 1) % kBdLen;
+  /* Deferred, the frame waits in the ring for tx_kick(). */
+  if (_quick_submit && _kick_deferred)
+    return static_cast<int>(len);
   _t.mmio_write<uint16_t>(r.reg_idx, static_cast<uint16_t>(r.wp & IDX_MASK));
+  r.told = r.wp;
   /* The page stays busy either way: a timed-out fetch may still complete,
    * and only its RPP can prove the hardware is done with the buffers. */
   if (_quick_submit)
@@ -641,6 +647,25 @@ void PcieDmaAx::rx_loop(
 void PcieDmaAx::irq_mask() {
   _t.mmio_write<uint32_t>(R_AX_PCIE_HIMR00_V1, 0);
   _t.mmio_write<uint32_t>(R_AX_HAXI_HIMR00, 0);
+}
+
+void PcieDmaAx::set_tx_kick_deferred(bool deferred) {
+  _kick_deferred = deferred;
+  if (!deferred) tx_kick();
+}
+
+bool PcieDmaAx::tx_kick() {
+  bool any = false;
+  for (uint32_t ch = 0; ch < kTxChannels; ch++) {
+    if (ch == kFwcmdCh) continue;
+    std::lock_guard<std::mutex> lk(_tx_mu[ch]);
+    TxRing &r = _tx[ch];
+    if (r.told == r.wp) continue;
+    _t.mmio_write<uint16_t>(r.reg_idx, static_cast<uint16_t>(r.wp & IDX_MASK));
+    r.told = r.wp;
+    any = true;
+  }
+  return any;
 }
 
 void PcieDmaAx::add_tx_reports(TxStats &stats) const {
