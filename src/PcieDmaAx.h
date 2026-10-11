@@ -86,6 +86,7 @@ public:
     uint64_t unknown_seq = 0, pages_freed = 0;
   };
   RppStats rpp_stats() const;
+  void add_tx_reports(TxStats &stats) const override;
 
 private:
   struct TxRing {

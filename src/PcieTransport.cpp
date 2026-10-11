@@ -153,6 +153,7 @@ devourer::TxStats PcieTransport::tx_stats() const {
   s.failed = _tx_failed.load(std::memory_order_relaxed);
   s.last_error_rc = _tx_last_rc.load(std::memory_order_relaxed);
   s.last_was_timeout = s.failed != 0;
+  if (_dma) _dma->add_tx_reports(s);
   return s;
 }
 

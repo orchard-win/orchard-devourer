@@ -17,6 +17,8 @@
 #include <functional>
 #include <vector>
 
+#include "TxStats.h"
+
 namespace devourer {
 
 /* DMA memory handed to a plane. With chunk_bytes set it is bus-contiguous only
@@ -83,6 +85,10 @@ public:
    * the AX plane. Returns bytes submitted or a negative error. */
   virtual int tx_submit(uint8_t hint, uint8_t *buf, size_t len,
                         int timeout_ms) = 0;
+
+  /* Adds what the chip reported about sent frames (TxStats::reported and
+   * given_up) on a plane whose bus carries such reports. */
+  virtual void add_tx_reports(TxStats &) const {}
 
   /* Blocking RX reap loop until should_stop(); each delivery is one chip
    * packet (descriptor-headed), never a USB-style aggregate. */

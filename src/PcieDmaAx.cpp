@@ -626,6 +626,12 @@ void PcieDmaAx::irq_mask() {
   _t.mmio_write<uint32_t>(R_AX_HAXI_HIMR00, 0);
 }
 
+void PcieDmaAx::add_tx_reports(TxStats &stats) const {
+  const RppStats s = rpp_stats();
+  stats.given_up = s.retry_limit + s.lifetime + s.macid_drop;
+  stats.reported = s.tx_done + stats.given_up;
+}
+
 PcieDmaAx::RppStats PcieDmaAx::rpp_stats() const {
   std::lock_guard<std::mutex> lk(_pool_mu); /* written under it by release_page */
   return _rpp;

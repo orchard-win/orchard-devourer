@@ -40,6 +40,13 @@ struct TxStats {
   int last_error_rc = 0;      /* raw libusb rc / negated transfer status /
                                * kTxShortWriteRc */
   bool last_was_timeout = false;
+  /* What the chip said became of the frames it took, where the bus carries
+   * such reports (the AX PCIe release reports; zero elsewhere): how many it
+   * has reported on, and how many of those it gave up on — retry limit,
+   * lifetime or a dropped MACID. A group-addressed frame is never given up
+   * on. Reports come in the order the chip finished the frames. */
+  uint64_t reported = 0;
+  uint64_t given_up = 0;
 };
 
 } // namespace devourer

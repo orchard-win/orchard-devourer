@@ -382,6 +382,20 @@ received at that tuning is 40 MHz PPDUs in the upper half of the block. No
 80 MHz frame has been seen. Monitor and injection sessions do not go through
 this.
 
+## Sending to a station from the 8852CE (PCIe, Windows)
+
+A station session sends unicast data like any injected frame: the rate is the
+radiotap header's, one MPDU per PPDU, `DISDATAFB` set, so every retry airs at
+that same rate. Measured on one RTL8852CE tuned to 80 MHz (primary 44)
+against one iPhone, 24.5 MB of TCP each time: legacy
+12 Mbit/s about 1 MB/s while the phone listened; `MCS7` 18.2 s;
+`VHT2SS_MCS7/80/SGI` 10.8 s; `MCS15/40/SGI` not one frame acknowledged, cause
+not found, so a 40 MHz HT frame from an 80 MHz tuning is unproven at best.
+The PCIe release reports say what became of each frame, and
+`TxStats::reported` / `given_up` now carry their totals (`GetTxStats`); the
+caller that picks a rate from them has to discount frames lost while the
+peer was off the channel. No TX A-MPDU exists on this generation.
+
 ## Scope
 
 The capstone is 11ax trigger-based UL + TWT (issue #236 — the v1.19 vendor
