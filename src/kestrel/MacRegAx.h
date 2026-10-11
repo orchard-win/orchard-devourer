@@ -677,9 +677,14 @@ constexpr uint8_t FWCMD_H2C_CL_FR_EXCHG = 0x5;
 constexpr uint8_t FWCMD_H2C_FUNC_CCTLINFO_UD = 0x2;
 constexpr uint8_t FWCMD_H2C_FUNC_DCTLINFO_UD = 0x1;
 
-/* addr_cam entry geometry (addr_cam.h): 8852B uses the LONG entry (0x40). */
+/* addr_cam entry geometry (addr_cam.h get_addr_cam_size): 8852A/8852B/8851B
+ * use the LONG entry, every later chip including the 8852C the SHORT one. */
 constexpr uint8_t ADDR_CAM_ENT_LONG_SIZE = 0x40;
+constexpr uint8_t ADDR_CAM_ENT_SHORT_SIZE = 0x20;
 constexpr uint8_t BSSID_CAM_ENT_SIZE = 0x08;
+/* BSSID CAM byte mask: one bit per BSSID byte that must match (rtw89
+ * RTW89_BSSID_MATCH_ALL). */
+constexpr uint8_t BSSID_CAM_MATCH_ALL = 0x3f;
 /* mac_ax_addr_msk_sel (mac_def.h). */
 constexpr uint8_t MAC_AX_NO_MSK = 0;
 /* mac_ax_data_rate (type.h) — the CCTL default rate. */
@@ -1417,6 +1422,9 @@ constexpr uint32_t CCA_CTRL_CLR =
     (1u << 31) | (1u << 27) | (1u << 26) | (1u << 25) | /* TB tx_nav/cca s80/s40/s20 */
     (1u << 19) | (1u << 18) | (1u << 17) |              /* SIFS cca s80/s40/s20 */
     (1u << 8) | (1u << 20);                             /* CTN txnav, SIFS edcca */
+/* A SIFS-spaced transmission, which every response frame is, waits for
+ * Bluetooth to be idle (one of the cca_ctrl_init sets). */
+constexpr uint32_t B_AX_SIFS_CHK_BTCCA = 1u << 21;
 constexpr uint16_t R_AX_RCR = 0xCE00;
 constexpr uint8_t B_AX_CH_EN_SH = 0;
 constexpr uint32_t B_AX_CH_EN_MSK = 0xf; /* 8852B RCR channel-enable [3:0] */
@@ -1561,6 +1569,9 @@ constexpr uint32_t B_AX_SW_PREFER_AC_MSK = 0x3;
 constexpr uint32_t MAC_AX_CMAC_AC_SEL_BK = 1;
 /* trxptcl_init */
 constexpr uint16_t R_AX_TRXPTCL_RESP_0 = 0xCC04;
+/* R_AX_TRXPTCL_RESP_0 [28:23], all set out of reset, are what must be idle
+ * for a response to be sent (rtw89 reg.h); this one is Bluetooth. */
+constexpr uint32_t B_AX_RSP_CHK_BTCCA = 1u << 25;
 constexpr uint8_t B_AX_WMAC_SPEC_SIFS_CCK_SH = 0;
 constexpr uint32_t B_AX_WMAC_SPEC_SIFS_CCK_MSK = 0xff;
 constexpr uint32_t WMAC_SPEC_SIFS_CCK = 0xA;

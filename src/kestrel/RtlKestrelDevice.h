@@ -174,7 +174,13 @@ public:
    * prior InitWrite. `beacon` is a full 802.11 beacon; the MAC airs it every
    * `interval_tu` TU with the live TSF inserted. */
   bool StartBeacon(const uint8_t *beacon, size_t len, int interval_tu) override;
+  /* The 8852C over PCIe only, where it was measured against an AWDL peer:
+   * see HalKestrel::set_station_identity. Call after InitWrite. */
+  bool SetStationIdentity(const devourer::MacAddr &own,
+                          const devourer::MacAddr &bssid) override;
+  bool ClearStationIdentity() override;
   int _bcn_interval_tu = 0; /* >0 while a HW beacon is armed (StartBeacon) */
+  bool _station_identity = false; /* SetStationIdentity is in effect */
 
   /* 802.11ax scheduled UL: air an HE Basic Trigger (UL-OFDMA grant), program
    * TWT agreements + STA binds, and the fw-autonomous trigger cadence

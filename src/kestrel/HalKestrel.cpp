@@ -8,6 +8,7 @@
 
 #include "KestrelFw.h"
 #include "MacRegAx.h"
+#include "PreciseDelay.h"
 #include "kestrel_halbb_glue.h" /* vendored halbb-G6 BB bring-up (C) */
 #include "kestrel_halrf_glue.h" /* vendored halrf-G6 RF cals (C) */
 
@@ -16,9 +17,7 @@ namespace kestrel {
 namespace {
 namespace r = kestrel::reg;
 
-void delay_us(uint32_t us) {
-  std::this_thread::sleep_for(std::chrono::microseconds(us));
-}
+void delay_us(uint32_t us) { devourer::precise_delay_us(us); }
 
 } /* namespace */
 
@@ -542,7 +541,7 @@ bool HalKestrel::power_on_8852c() {
   set32(r::R_AX_PMC_DBG_CTRL2, r::B_AX_SYSON_DIS_PMCR_AX_WRMSK); /* 0xCC[2]=1 */
   set32(r::R_AX_SYS_ISO_CTRL, r::B_AX_ISO_EB2CORE);             /* 0x00[8]=1 */
   clr32(r::R_AX_SYS_ISO_CTRL, 1u << 15);                        /* 0x00[15]=0 */
-  std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  delay_us(1000);
   clr32(r::R_AX_SYS_ISO_CTRL, 1u << 14);                        /* 0x00[14]=0 */
   clr32(r::R_AX_PMC_DBG_CTRL2, r::B_AX_SYSON_DIS_PMCR_AX_WRMSK); /* 0xCC[2]=0 */
   if (pcie) /* PCIe: GPIO16/17/18 internal weak pull-low */
@@ -611,7 +610,7 @@ bool HalKestrel::power_on() {
       return false; /* poll 0x04[9]=0 */
     clr32(r::R_AX_SYS_PW_CTRL, r::B_AX_EN_WLON);
     clr32(r::R_AX_SYS_PW_CTRL, r::B_AX_APFM_SWLPS);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    delay_us(1000);
     /* 8852A/8852B/8851B/8852BT only (pwr.c:380): CMAC clock source back to
      * default before the on-sequence. */
     if (_variant != ChipVariant::C8852C)
@@ -682,7 +681,7 @@ bool HalKestrel::power_on() {
   set32(r::R_AX_PMC_DBG_CTRL2, r::B_AX_SYSON_DIS_PMCR_AX_WRMSK); /* 0xCC[2]=1 */
   set32(r::R_AX_SYS_ISO_CTRL, r::B_AX_ISO_EB2CORE);             /* 0x00[8]=1 */
   clr32(r::R_AX_SYS_ISO_CTRL, 1u << 15);                        /* 0x00[15]=0 */
-  std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  delay_us(1000);
   clr32(r::R_AX_SYS_ISO_CTRL, 1u << 14);                    /* 0x00[14]=0 */
   clr32(r::R_AX_PMC_DBG_CTRL2, r::B_AX_SYSON_DIS_PMCR_AX_WRMSK); /* 0xCC[2]=0 */
 
@@ -834,7 +833,7 @@ void HalKestrel::fw_err_settle(const char *where, uint32_t ms) {
                      where, i, _device.rtw_read32(r::R_AX_HALT_C2H));
       return;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    delay_us(1000);
   }
   _logger->info("Kestrel: fw stable through [{}] ({} ms, no SER)", where, ms);
 }
@@ -1592,6 +1591,40 @@ void HalKestrel::port_init() {
   _logger->info("Kestrel TRX: CMAC port0 enabled (NO_LINK) — TX context up "
                 "(PORT_CFG_P0=0x{:08x})",
                 v);
+}
+
+namespace {
+/* With these set, a unicast or broadcast frame also has to come from the
+ * address CAM entry's peer, which a station in an open group never is. */
+constexpr uint32_t kRxFromPeerOnly =
+    kestrel::reg::B_AX_A_UC_CAM_MATCH | kestrel::reg::B_AX_A_BC_CAM_MATCH;
+} /* namespace */
+
+bool HalKestrel::set_station_identity(const uint8_t own[6],
+                                      const uint8_t bssid[6]) {
+  namespace r = kestrel::reg;
+  const bool ok = _fw.fw_upd_addr_cam(/*macid=*/0, own, r::MAC_AX_NET_TYPE_ADHOC,
+                                      /*addr_cam_idx=*/0, /*bssid_cam_idx=*/0,
+                                      bssid);
+  field32(r::R_AX_PORT_CFG_P0, r::MAC_AX_NET_TYPE_ADHOC, r::B_AX_NET_TYPE_P0_MSK,
+          r::B_AX_NET_TYPE_P0_SH);
+  clr32(r::R_AX_RX_FLTR_OPT, r::B_AX_SNIFFER_MODE | kRxFromPeerOnly);
+  clr32(r::R_AX_CCA_CONTROL, r::B_AX_SIFS_CHK_BTCCA);
+  clr32(r::R_AX_TRXPTCL_RESP_0, r::B_AX_RSP_CHK_BTCCA);
+  return ok;
+}
+
+bool HalKestrel::clear_station_identity(const uint8_t inject_sa[6]) {
+  namespace r = kestrel::reg;
+  const bool ok =
+      _fw.fw_upd_addr_cam(/*macid=*/0, inject_sa, r::MAC_AX_NET_TYPE_NO_LINK,
+                          /*addr_cam_idx=*/0, /*bssid_cam_idx=*/0);
+  field32(r::R_AX_PORT_CFG_P0, r::MAC_AX_NET_TYPE_NO_LINK,
+          r::B_AX_NET_TYPE_P0_MSK, r::B_AX_NET_TYPE_P0_SH);
+  set32(r::R_AX_RX_FLTR_OPT, r::B_AX_SNIFFER_MODE | kRxFromPeerOnly);
+  set32(r::R_AX_CCA_CONTROL, r::B_AX_SIFS_CHK_BTCCA);
+  set32(r::R_AX_TRXPTCL_RESP_0, r::B_AX_RSP_CHK_BTCCA);
+  return ok;
 }
 
 void HalKestrel::sch_tx_en() {

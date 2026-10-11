@@ -7,6 +7,7 @@
 
 #include "KestrelLe.h"
 #include "MacRegAx.h"
+#include "PreciseDelay.h"
 #include "SignalStop.h" /* g_devourer_should_stop — set by demo signal handlers */
 #if defined(DEVOURER_HAVE_KESTREL_8852B)
 #include "hal8852b_fw.h"
@@ -20,9 +21,7 @@ namespace kestrel {
 namespace {
 namespace r = kestrel::reg;
 
-void delay_us(uint32_t us) {
-  std::this_thread::sleep_for(std::chrono::microseconds(us));
-}
+void delay_us(uint32_t us) { devourer::precise_delay_us(us); }
 
 /* le32 / put_le32 now live in KestrelLe.h (shared with KestrelFwSched.cpp);
  * pull them into this anonymous namespace so existing unqualified uses below
@@ -419,17 +418,24 @@ bool KestrelFw::fw_role_maintain(uint8_t macid, uint8_t self_role,
   return ok;
 }
 
+uint8_t KestrelFw::addr_cam_entry_size() const {
+  return _variant == ChipVariant::C8852C ? r::ADDR_CAM_ENT_SHORT_SIZE
+                                         : r::ADDR_CAM_ENT_LONG_SIZE;
+}
+
 bool KestrelFw::fw_upd_addr_cam(uint8_t macid, const uint8_t self_mac[6],
                                 uint8_t net_type, uint8_t addr_cam_idx,
-                                uint8_t bssid_cam_idx) {
+                                uint8_t bssid_cam_idx, const uint8_t *bssid) {
   /* fill_addr_cam_info + fill_bssid_cam_info (addr_cam.c). 15-dword body
-   * (fwcmd_addrcam_info): dword0 rsvd, dword7 rsvd. mask_sel = NO_MSK, so both
-   * hashes are the full-6-byte XOR (default case). len = ADDR_CAM_ENT_LONG_SIZE
-   * (8852B), b_len = BSSID_CAM_ENT_SIZE. bssid = self_mac (self/NO_LINK STA). */
+   * (fwcmd_addrcam_info): dword0 and dword7 are reserved. mask_sel = NO_MSK,
+   * so both hashes are the full-6-byte XOR. Without `bssid` the entry is the
+   * self/NO_LINK STA one, bssid = tma = self_mac; with it, tma follows the
+   * BSSID as in rtw89_cam_fill_addr_cam_info. */
+  const uint8_t *tma = bssid ? bssid : self_mac;
   uint8_t sma_hash = 0, tma_hash = 0;
   for (int i = 0; i < 6; i++) {
     sma_hash ^= self_mac[i];
-    tma_hash ^= self_mac[i];
+    tma_hash ^= tma[i];
   }
   uint8_t c[60] = {0};
   auto sw = [](uint32_t v, uint32_t msk, uint32_t sh) {
@@ -437,7 +443,7 @@ bool KestrelFw::fw_upd_addr_cam(uint8_t macid, const uint8_t self_mac[6],
   };
   /* dword1: idx / offset / len */
   put_le32(c + 4, sw(addr_cam_idx, 0xff, 0) | sw(0, 0xff, 8) |
-                      sw(r::ADDR_CAM_ENT_LONG_SIZE, 0xff, 16));
+                      sw(addr_cam_entry_size(), 0xff, 16));
   /* dword2: valid / net_type / bcn_hit_cond / hit_rule / addr_mask / mask_sel /
    * sma_hash / tma_hash */
   put_le32(c + 8, 0x1u /* VALID BIT(0) */ | sw(net_type, 0x3, 1) |
@@ -450,24 +456,23 @@ bool KestrelFw::fw_upd_addr_cam(uint8_t macid, const uint8_t self_mac[6],
                        sw(self_mac[2], 0xff, 16) | sw(self_mac[3], 0xff, 24));
   /* dword5: sma[4],sma[5],tma[0],tma[1] */
   put_le32(c + 20, sw(self_mac[4], 0xff, 0) | sw(self_mac[5], 0xff, 8) |
-                       sw(self_mac[0], 0xff, 16) | sw(self_mac[1], 0xff, 24));
+                       sw(tma[0], 0xff, 16) | sw(tma[1], 0xff, 24));
   /* dword6: tma[2..5] */
-  put_le32(c + 24, sw(self_mac[2], 0xff, 0) | sw(self_mac[3], 0xff, 8) |
-                       sw(self_mac[4], 0xff, 16) | sw(self_mac[5], 0xff, 24));
-  /* dword7 rsvd (c+28) */
+  put_le32(c + 24, sw(tma[2], 0xff, 0) | sw(tma[3], 0xff, 8) |
+                       sw(tma[4], 0xff, 16) | sw(tma[5], 0xff, 24));
   /* dword8: macid / port_int / tsf_sync / tgt_ind / frm_tgt_ind (all 0 here) */
   put_le32(c + 32, sw(macid, 0xff, 0));
   /* dword9..11: aid12 / sec — all 0 */
   /* dword12: bssid cam idx / offset / len */
   put_le32(c + 48, sw(bssid_cam_idx, 0xff, 0) | sw(0, 0xff, 8) |
                        sw(r::BSSID_CAM_ENT_SIZE, 0xff, 16));
-  /* dword13: b_valid / b_msk(NO_MSK) / bss_color / bssid[0..1] */
-  put_le32(c + 52, 0x1u /* B_VALID BIT(0) */ | sw(r::MAC_AX_NO_MSK, 0x3f, 2) |
-                       sw(0, 0x3f, 8) | sw(self_mac[0], 0xff, 16) |
-                       sw(self_mac[1], 0xff, 24));
+  /* dword13: b_valid / b_msk / bss_color / bssid[0..1] */
+  put_le32(c + 52, 0x1u /* B_VALID BIT(0) */ |
+                       sw(r::BSSID_CAM_MATCH_ALL, 0x3f, 2) | sw(0, 0x3f, 8) |
+                       sw(tma[0], 0xff, 16) | sw(tma[1], 0xff, 24));
   /* dword14: bssid[2..5] */
-  put_le32(c + 56, sw(self_mac[2], 0xff, 0) | sw(self_mac[3], 0xff, 8) |
-                       sw(self_mac[4], 0xff, 16) | sw(self_mac[5], 0xff, 24));
+  put_le32(c + 56, sw(tma[2], 0xff, 0) | sw(tma[3], 0xff, 8) |
+                       sw(tma[4], 0xff, 16) | sw(tma[5], 0xff, 24));
   bool ok = send_h2c_cmd(r::FWCMD_H2C_CAT_MAC, r::FWCMD_H2C_CL_ADDR_CAM_UPDATE,
                          r::FWCMD_H2C_FUNC_ADDRCAM_INFO, c, sizeof(c));
   _logger->info("Kestrel: upd_addr_cam (macid={} net_type={} a_idx={} b_idx={} "

@@ -289,6 +289,12 @@ public:
     return ok;
   }
 
+  /* Makes the MAC acknowledge frames for `own` in BSS `bssid`: names them in
+   * the address CAM, leaves sniffer mode, and lets responses ignore Bluetooth. */
+  bool set_station_identity(const uint8_t own[6], const uint8_t bssid[6]);
+  /* Back to `inject_sa` with no link, sniffer mode and the Bluetooth wait. */
+  bool clear_station_identity(const uint8_t inject_sa[6]);
+
   /* ---- 802.11ax scheduled-UL levers (KestrelFwSched.cpp encoders) ---- */
 
   /* Fire one HE Basic Trigger (UL-OFDMA grant) via the F2P command. */

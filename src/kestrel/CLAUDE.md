@@ -327,6 +327,29 @@ root CLAUDE.md says to measure before reading as a difference between the
 cards. One lab, near field, no SDR: delivery figures for this pair, not a
 link-budget claim.
 
+## Station identity and hardware ACK (8852C over PCIe)
+
+`SetStationIdentity(own, bssid)` makes the MAC acknowledge unicast addressed to
+`own` (`HalKestrel::set_station_identity`). It names `own`/`bssid` in the
+macid-0 address CAM entry, takes RX out of sniffer mode (A1 match, broadcast
+and multicast remain), and clears the two Bluetooth conditions on response
+frames: `SIFS_CHK_BTCCA` in `R_AX_CCA_CONTROL` and `RSP_CHK_BTCCA` in
+`R_AX_TRXPTCL_RESP_0`. Measured on one RTL8852CE under Windows, its Bluetooth
+half in use by the OS, against an iPhone sending AWDL data: the share of
+received data frames carrying the retry flag fell from 81-86% (every frame
+sent seven times) to 0-4%. In the same sweep the entry's network type, an AP
+role, a JOININFO command, sniffer mode on or off, naming the sender as the
+entry's peer and the BSSID-fit port bits each changed nothing. Not separated:
+which of the two Bluetooth bits is the one that matters. Coexistence is not
+set up on the 8852C, so the card may now answer over a Bluetooth transmission.
+`station_mode_ok` stays false: the peer was an AWDL device, not an AP, and USB
+is unmeasured.
+
+Two address CAM facts corrected on the way (vendor `get_addr_cam_size`, rtw89
+`cam.c`): the 8852C entry is the short one (0x20 bytes), and the BSSID mask is
+0x3f, one bit per byte to compare. `fw_upd_addr_cam` sent the 8852B's 0x40 and
+a mask of 0 before.
+
 ## Scope
 
 The capstone is 11ax trigger-based UL + TWT (issue #236 — the v1.19 vendor

@@ -853,6 +853,24 @@ bool RtlKestrelDevice::SendTrigger(const devourer::TriggerConfig &cfg) {
   return _hal.send_trigger(cfg);
 }
 
+bool RtlKestrelDevice::SetStationIdentity(const devourer::MacAddr &own,
+                                          const devourer::MacAddr &bssid) {
+  if (!_tx_up || _variant != kestrel::ChipVariant::C8852C || _device.is_usb()) {
+    _logger->error("Kestrel: SetStationIdentity needs an RTL8852CE after "
+                   "InitWrite");
+    return false;
+  }
+  _station_identity = _hal.set_station_identity(own.data(), bssid.data());
+  return _station_identity;
+}
+
+bool RtlKestrelDevice::ClearStationIdentity() {
+  if (!_station_identity)
+    return true;
+  _station_identity = false;
+  return _hal.clear_station_identity(kInjectSA);
+}
+
 bool RtlKestrelDevice::ConfigureTwt(const devourer::TwtConfig &cfg) {
   if (!_tx_up) {
     _logger->error("Kestrel: ConfigureTwt before InitWrite");

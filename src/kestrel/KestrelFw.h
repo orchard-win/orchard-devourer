@@ -6,6 +6,8 @@
 #include <mutex>
 #include <vector>
 
+#include <array>
+
 #include "ChipVariant.h"
 #include "RtlAdapter.h"
 #include "Sounding.h"
@@ -74,7 +76,8 @@ public:
    * CAM entries (0 for the first/self STA). The frame's SA/BSSID resolve from
    * this entry; without it the CMAC cannot build the PPDU. */
   bool fw_upd_addr_cam(uint8_t macid, const uint8_t self_mac[6], uint8_t net_type,
-                       uint8_t addr_cam_idx, uint8_t bssid_cam_idx);
+                       uint8_t addr_cam_idx, uint8_t bssid_cam_idx,
+                       const uint8_t *bssid = nullptr);
 
   /* mac_upd_cctl_info (tblupd.c): H2C cat=MAC, class=FR_EXCHG, func=CCTLINFO_UD
    * — the per-MACID CMAC control table. Sets the default TX rate, the TX
@@ -193,6 +196,8 @@ private:
 
   RtlAdapter _device;
   Logger_t _logger;
+  uint8_t addr_cam_entry_size() const;
+
   ChipVariant _variant;
   /* CH12 (FWDL/H2C) queue handle, bus-neutral: the bulk-OUT endpoint on USB
    * (BULKOUTID2), the DMA channel number 12 on PCIe (PcieDmaAx routes on it). */
