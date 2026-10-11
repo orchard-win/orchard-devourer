@@ -1,4 +1,5 @@
 #include "HalKestrel.h"
+#include "TxSubChannel.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1600,9 +1601,30 @@ constexpr uint32_t kRxFromPeerOnly =
     kestrel::reg::B_AX_A_UC_CAM_MATCH | kestrel::reg::B_AX_A_BC_CAM_MATCH;
 } /* namespace */
 
+void HalKestrel::set_channel_mac(unsigned width_mhz) {
+  namespace r = kestrel::reg;
+  /* rtw8852c_set_channel_mac. A 20 MHz channel is the reset state. */
+  field32(r::R_AX_WMAC_RFMOD, width_mhz == 80 ? 2 : width_mhz == 40 ? 1 : 0,
+          r::B_AX_WMAC_RFMOD_MSK, 0);
+  _device.rtw_write32(
+      r::R_AX_TX_SUB_CARRIER_VALUE,
+      kestrel::tx_sub_channels(_cur_primary, _cur_center, width_mhz));
+  clr32(r::R_AX_TXRATE_CHK, r::B_AX_BAND_MODE | r::B_AX_CHECK_CCK_EN |
+                                r::B_AX_RTS_LIMIT_IN_OFDM6);
+  if (width_mhz != 20)
+    set32(r::R_AX_TXRATE_CHK, _cur_band_type == 0
+                                  ? r::B_AX_BAND_MODE
+                                  : r::B_AX_CHECK_CCK_EN |
+                                        r::B_AX_RTS_LIMIT_IN_OFDM6);
+}
+
 bool HalKestrel::set_station_identity(const uint8_t own[6],
                                       const uint8_t bssid[6]) {
   namespace r = kestrel::reg;
+  /* A station answers on its primary 20 MHz: only then does the width of a
+   * wider channel matter to the MAC. */
+  if (_cur_width_mhz != 20)
+    set_channel_mac(_cur_width_mhz);
   const bool ok = _fw.fw_upd_addr_cam(/*macid=*/0, own, r::MAC_AX_NET_TYPE_ADHOC,
                                       /*addr_cam_idx=*/0, /*bssid_cam_idx=*/0,
                                       bssid);
@@ -1632,6 +1654,8 @@ bool HalKestrel::end_block_ack() {
 
 bool HalKestrel::clear_station_identity(const uint8_t inject_sa[6]) {
   namespace r = kestrel::reg;
+  if (_cur_width_mhz != 20)
+    set_channel_mac(20);
   const bool ok =
       _fw.fw_upd_addr_cam(/*macid=*/0, inject_sa, r::MAC_AX_NET_TYPE_NO_LINK,
                           /*addr_cam_idx=*/0, /*bssid_cam_idx=*/0);
@@ -2716,6 +2740,9 @@ bool HalKestrel::set_channel(uint8_t channel, ChannelWidth_t bw,
    * the core's halrf_ctl_ch + halrf_ctl_bw generics (synth lock rides inside
    * halrf_ctrl_ch_8852b). */
   vnd_rf_tune(band_type, center, bw);
+  _cur_primary = channel;
+  _cur_center = center;
+  _cur_width_mhz = bw == CHANNEL_WIDTH_80 ? 80 : bw == CHANNEL_WIDTH_40 ? 40 : 20;
 
   /* Full vendor per-channel BB config (halbb_ctrl_bw_ch -> per-chip backend),
    * both chips: per-band gain-error, hidden/normal efuse RX gain, band

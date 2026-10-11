@@ -1416,6 +1416,14 @@ constexpr uint8_t B_AX_S1_LDO_VSEL_F_SH = 24; /* [25:24] */
 constexpr uint16_t R_AX_RXDMA_CTRL_0 = 0xC804;
 constexpr uint32_t RX_FULL_MODE = /* RU0/1/2/3 + CSI + RXSTS ptr-full-mode */
     (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5);
+/* The MAC's own view of the channel (rtw8852c_set_channel_mac): its width,
+ * and which rates a 5 GHz channel rules out. */
+constexpr uint16_t R_AX_WMAC_RFMOD = 0xC010;
+constexpr uint32_t B_AX_WMAC_RFMOD_MSK = 0x3; /* 0 = 20, 1 = 40, 2 = 80 MHz */
+constexpr uint16_t R_AX_TXRATE_CHK = 0xC628;
+constexpr uint32_t B_AX_CHECK_CCK_EN = 1u << 0;
+constexpr uint32_t B_AX_RTS_LIMIT_IN_OFDM6 = 1u << 1;
+constexpr uint32_t B_AX_BAND_MODE = 1u << 4;
 constexpr uint16_t R_AX_TX_SUB_CARRIER_VALUE = 0xC088;
 constexpr uint8_t B_AX_TXSC_20M_SH = 0;
 constexpr uint8_t B_AX_TXSC_40M_SH = 4;

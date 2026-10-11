@@ -496,6 +496,13 @@ private:
   void rf_wrf(uint8_t path, uint32_t addr, uint32_t mask, uint32_t val);
   uint32_t rf_rrf(uint8_t path, uint32_t addr, uint32_t mask);
   uint8_t _cur_band_type = 1; /* band of the last set_channel (for FastRetune) */
+  /* The last set_channel, for set_channel_mac. */
+  uint8_t _cur_primary = 0;
+  uint8_t _cur_center = 0;
+  unsigned _cur_width_mhz = 20;
+  /* Tells the MAC the width of the tuned channel and where its primary
+   * 20 MHz lies, so that narrower frames and its own responses go there. */
+  void set_channel_mac(unsigned width_mhz);
 
 public:
   /* RF calibration at bring-up: the vendored halrf DACK + RX-DCK (both chips;
