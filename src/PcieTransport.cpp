@@ -50,7 +50,8 @@ bool PcieTransport::select_dma_plane() {
   switch (_pci_did) {
   case kPciDidRtl8852ce:
 #if defined(DEVOURER_HAVE_KESTREL_8852C)
-    _dma = std::make_unique<PcieDmaAx>(*this, _logger, _cfg.rx_poll_us);
+    _dma = std::make_unique<PcieDmaAx>(*this, _logger, _cfg.rx_poll_us,
+                                       _cfg.tx_quick_submit);
     return true;
 #else
     _logger->error("PcieTransport: RTL8852CE ({:04x}:{:04x}) needs "

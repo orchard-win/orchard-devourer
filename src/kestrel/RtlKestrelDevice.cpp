@@ -1302,7 +1302,13 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
   const int rl = _cfg.tx.retry_limit < 0    ? 0
                  : _cfg.tx.retry_limit > 62 ? 62
                                             : _cfg.tx.retry_limit;
-  const int txcnt = rl + 1;
+  /* A block-ack request is answered with a block ack, which the MAC does not
+   * take for the acknowledgement it waits for: it would repeat the request
+   * to the limit, about 8 ms of the medium, and report it given up on. */
+  constexpr uint8_t kFrameControlBlockAckRequest = 0x84;
+  const bool block_ack_request =
+      flen >= 16 && frame[0] == kFrameControlBlockAckRequest;
+  const int txcnt = block_ack_request ? 1 : rl + 1;
   /* An A-MPDU holds QoS data frames to one station. Such a frame goes out
    * under its own sequence number, not the rolling one. */
   constexpr uint32_t kQosDataHeaderLen = 26;

@@ -67,6 +67,17 @@ public:
      * a lost edge from ever stalling RX). Falls back to pure polling
      * automatically when MSI setup fails. */
     bool use_msi = true;
+    /* AX plane: hand a frame to the chip with one register access, the
+     * write of the ring index, instead of four. The other three read
+     * indexes back: whether the ring has room, what the chip has released,
+     * and that it fetched the frame. Where an access is slow (the Windows
+     * proxy: 31 us) they bound the send rate at about 8,000 frames a
+     * second and keep the MAC from ever having an aggregate's worth queued.
+     * With this set the ring's room is read only once half of it may be in
+     * use, releases are left to the receive loop unless pages run short,
+     * and a frame the chip never fetches is found by a later send, not this
+     * one. Firmware commands keep the full exchange. */
+    bool tx_quick_submit = false;
   };
 
   /* Open the device at `bdf` ("0000:01:00.0"). Returns null and logs on any

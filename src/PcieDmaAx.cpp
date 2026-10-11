@@ -133,8 +133,10 @@ Layout layout() {
 
 } /* namespace */
 
-PcieDmaAx::PcieDmaAx(PcieTransport &t, Logger_t logger, int rx_poll_us)
-    : _t(t), _logger(std::move(logger)), _rx_poll_us(rx_poll_us) {
+PcieDmaAx::PcieDmaAx(PcieTransport &t, Logger_t logger, int rx_poll_us,
+                     bool quick_submit)
+    : _t(t), _logger(std::move(logger)), _rx_poll_us(rx_poll_us),
+      _quick_submit(quick_submit) {
   static_assert(WD_BODY_LEN_V1 + WD_INFO_LEN + WP_INFO_SZ +
                         ADDR_INFO_NR_MAX * ADDR_INFO_SZ <=
                     kWdPageSize,
@@ -208,6 +210,7 @@ bool PcieDmaAx::attach(const DmaSlab &dma) {
     r.bd = slab + off;
     r.bd_iova = dma.iova(off);
     r.wp = 0;
+    r.hw_seen = 0;
     r.reg_num = kTxCh[ch].num;
     r.reg_idx = kTxCh[ch].idx;
     r.reg_bdram = kTxCh[ch].bdram;
@@ -283,6 +286,7 @@ void PcieDmaAx::setup_rings() {
   for (uint32_t ch = 0; ch < kTxChannels; ch++) {
     TxRing &r = _tx[ch];
     r.wp = 0;
+    r.hw_seen = 0;
     _t.mmio_write<uint16_t>(r.reg_num, static_cast<uint16_t>(kBdLen & IDX_MASK));
     _t.mmio_write<uint32_t>(r.reg_bdram, r.bdram);
     write_ring_base(r.reg_desa_l, r.bd_iova);
@@ -308,7 +312,7 @@ void PcieDmaAx::setup_rings() {
                 kBdLen, kBdLen, kRxBufSize, kWdPages, _slab.iova(_wd_off));
 }
 
-bool PcieDmaAx::ring_has_room(const TxRing &r, int ch) {
+bool PcieDmaAx::ring_has_room(TxRing &r, int ch) {
   /* Submissions a timed-out wait left unconsumed stay in the ring. The
    * hardware index can only be trusted as "caught up" while fewer than
    * kBdLen-1 entries are outstanding; at that point refuse rather than let a
@@ -316,6 +320,7 @@ bool PcieDmaAx::ring_has_room(const TxRing &r, int ch) {
   const uint32_t hw = hw_idx(r.reg_idx);
   if (hw >= kBdLen)
     return false; /* device gone — hw_idx logged it */
+  r.hw_seen = hw;
   const uint32_t outstanding = (r.wp + kBdLen - hw) % kBdLen;
   if (outstanding >= kBdLen - 1) {
     _logger->error("PcieDmaAx: CH{} ring stalled ({} unconsumed entries, hw={} "
@@ -406,14 +411,24 @@ int PcieDmaAx::submit_wd(int ch, uint8_t *buf, size_t len, int timeout_ms) {
                    flen, kPayloadSize);
     return -1;
   }
-  if (!ring_has_room(_tx[ch], ch))
+  /* The hardware index only moves forward, so the last one read can only
+   * overstate what is outstanding: the ring need not be asked again before
+   * half of it may be in use. */
+  TxRing &ring = _tx[ch];
+  const bool room_known =
+      _quick_submit &&
+      (ring.wp + kBdLen - ring.hw_seen) % kBdLen < kBdLen / 2;
+  if (!room_known && !ring_has_room(ring, ch))
     return -1;
 
-  /* A free page, reaping release reports first; starve → wait on the RPQ. */
+  /* A free page, reaping release reports first; starve → wait on the RPQ.
+   * The receive loop reaps them as well, so a quick submission only does
+   * while pages are short. */
   uint16_t page;
   {
     std::unique_lock<std::mutex> lk(_pool_mu);
-    reap_rpq_locked();
+    if (!_quick_submit || _free_pages.size() < kWdPages / 4)
+      reap_rpq_locked();
     const auto deadline =
         std::chrono::steady_clock::now() +
         std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 20);
@@ -483,6 +498,8 @@ int PcieDmaAx::submit_wd(int ch, uint8_t *buf, size_t len, int timeout_ms) {
   _t.mmio_write<uint16_t>(r.reg_idx, static_cast<uint16_t>(r.wp & IDX_MASK));
   /* The page stays busy either way: a timed-out fetch may still complete,
    * and only its RPP can prove the hardware is done with the buffers. */
+  if (_quick_submit)
+    return static_cast<int>(len);
   return wait_consumed(r, ch, timeout_ms) ? static_cast<int>(len) : -1;
 }
 

@@ -65,7 +65,8 @@ public:
   static constexpr uint32_t kRxBufStride = 16384;
   static constexpr uint32_t kFwcmdSlotStride = 4096;
 
-  PcieDmaAx(PcieTransport &t, Logger_t logger, int rx_poll_us);
+  PcieDmaAx(PcieTransport &t, Logger_t logger, int rx_poll_us,
+            bool quick_submit = false);
 
   const char *name() const override { return "ax-haxi"; }
   size_t slab_bytes() const override;
@@ -93,6 +94,7 @@ private:
     volatile uint8_t *bd = nullptr; /* kBdLen × 8 B */
     uint64_t bd_iova = 0;
     uint32_t wp = 0;
+    uint32_t hw_seen = 0; /* the hardware index when it was last read */
     uint16_t reg_num = 0, reg_idx = 0, reg_bdram = 0, reg_desa_l = 0;
     uint32_t bdram = 0;
   };
@@ -107,7 +109,7 @@ private:
 
   void arm_rx_bd(RxRing &r, uint32_t idx);
   uint32_t hw_idx(uint16_t reg_idx);
-  bool ring_has_room(const TxRing &r, int ch);
+  bool ring_has_room(TxRing &r, int ch);
   bool wait_consumed(TxRing &r, int ch, int timeout_ms);
   int submit_fwcmd(uint8_t *buf, size_t len, int timeout_ms);
   int submit_wd(int ch, uint8_t *buf, size_t len, int timeout_ms);
@@ -121,6 +123,7 @@ private:
   PcieTransport &_t;
   Logger_t _logger;
   int _rx_poll_us;
+  bool _quick_submit; /* PcieTransport::Config::tx_quick_submit */
 
   std::array<TxRing, kTxChannels> _tx{};
   RxRing _rxq{}, _rpq{};

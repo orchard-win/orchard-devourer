@@ -406,9 +406,22 @@ above, with the fixed VHT rate: aggregates formed at once, up to 1,568
 frames in 200 ms. The MAC does not tell the receiver when it gives up on an
 MPDU. Without a block-ack request from the host that moves the receiver's
 window, each agreement stalled within two seconds and the phone ended it;
-with one, a 24.5 MB transfer ran under a single agreement at 4.7 MB/s. A
-block ack covered 2.6 MPDUs on average, far below the 64 allowed, cause not
-found. One card, one peer, one run of each.
+with one, a 24.5 MB transfer ran under a single agreement at 4.7 MB/s.
+
+`send_packet` sends a block-ack request (frame control 0x84) with one
+attempt. The MAC waits for an ACK after it, the peer answers with a block
+ack, and with the session's retry limit the request aired eight times over
+about 8 ms and came back as given up on: 322 of them took half of that
+transfer's airtime. A caller that reads `TxStats::given_up` has to expect
+one for every such request.
+
+On the Windows transport a register access costs 31 us and `submit_wd`
+makes four, which capped that transfer at 8,000 frames a second with about 4
+MPDUs per A-MPDU. `PcieTransport::Config::tx_quick_submit` leaves the index
+write only (`src/PcieTransport.h` says what is given up). With it the same
+transfer ran at 11.8 MB/s on the air, 13.9 MPDUs per A-MPDU, peaks of 3,545
+frames in 200 ms. One card, one peer, one run of each; under vfio, where an
+access is a memory write, the switch is unmeasured.
 
 ## Scope
 
