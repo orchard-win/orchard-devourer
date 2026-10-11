@@ -375,8 +375,12 @@ channel 44 at 40 MHz against an iPhone: its 40 MHz HT MCS 15 A-MPDUs were
 received at 37 us a frame (90 at 20 MHz), 1% with the retry flag, while our
 20 MHz legacy frames and the MAC's own CTS, ACK and BlockAck reached it. Not
 separated: which of the three writes that takes, since 40 MHz was never run
-without them. `RxAtrib.bw` read 0 for those frames. 80 MHz is coded and
-unmeasured; monitor and injection sessions do not go through this.
+without them. `RxAtrib.bw` read 0 for those frames. Tuned to 80 MHz
+(primary 44, centre 42) the same exchange ran with the iPhone on VHT MCS 9:
+68,916 data frames, 31 us apart, which is the 40 MHz rate, so what was
+received at that tuning is 40 MHz PPDUs in the upper half of the block. No
+80 MHz frame has been seen. Monitor and injection sessions do not go through
+this.
 
 ## Scope
 
