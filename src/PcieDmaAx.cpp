@@ -6,9 +6,11 @@
 #include <string>
 #include <thread>
 
+#include "PcieDmaAxDesc.h"
 #include "PcieDmaUtil.h"
 #include "PcieTransport.h"
 #include "kestrel/FrameParserKestrel.h"
+#include "kestrel/MacRegAx.h"
 
 namespace devourer {
 
@@ -50,8 +52,7 @@ constexpr uint16_t TXBD_OPTION_LS = 1u << 14;
 constexpr uint16_t TXWP_VALID = 1u << 15;
 constexpr uint32_t ADDR_INFO_NR_MAX = 10;        /* RTW89_TXADDR_INFO_NR_V1 */
 constexpr uint32_t ADDR_INFO_LEN_MAX = 2044;     /* TXADDR_INFO_LENTHG_V1_MAX */
-constexpr uint16_t ADDR_INFO_LS = 1u << 15;      /* B_PCIADDR_LS_V1_MASK */
-constexpr uint32_t ADDR_INFO_SZ = 6;
+constexpr uint32_t ADDR_INFO_SZ = pcie_ax::kAddrInfoBytes;
 constexpr uint32_t WP_INFO_SZ = 8;
 constexpr uint32_t RXBD_INFO_FS = 1u << 15;
 constexpr uint32_t RXBD_INFO_LS = 1u << 14;
@@ -88,38 +89,45 @@ inline void wr_le16(uint8_t *p, uint16_t v) {
   p[0] = static_cast<uint8_t>(v);
   p[1] = static_cast<uint8_t>(v >> 8);
 }
-/* 8-byte BD {le16 a, le16 b, le32 dma} as volatile byte stores. */
-inline void bd_write(volatile uint8_t *e, uint16_t a, uint16_t b, uint32_t dma) {
-  e[0] = static_cast<uint8_t>(a);
-  e[1] = static_cast<uint8_t>(a >> 8);
-  e[2] = static_cast<uint8_t>(b);
-  e[3] = static_cast<uint8_t>(b >> 8);
-  e[4] = static_cast<uint8_t>(dma);
-  e[5] = static_cast<uint8_t>(dma >> 8);
-  e[6] = static_cast<uint8_t>(dma >> 16);
-  e[7] = static_cast<uint8_t>(dma >> 24);
-}
+using pcie_ax::addr_info_write;
+using pcie_ax::bd_write;
 
-/* Slab layout offsets (page-aligned sections). */
+constexpr size_t RING_BYTES = PcieDmaAx::kBdLen * BD_SZ;
+
+constexpr bool is_pow2(size_t v) { return v && (v & (v - 1)) == 0; }
+static_assert(is_pow2(RING_BYTES) && is_pow2(PcieDmaAx::kRxBufStride) &&
+                  is_pow2(PcieDmaAx::kWdPageSize) &&
+                  is_pow2(PcieDmaAx::kPayloadSize) &&
+                  is_pow2(PcieDmaAx::kFwcmdSlotStride),
+              "slab strides must be powers of two (chunk-boundary safety)");
+static_assert(PcieDmaAx::kRxBufStride >= PcieDmaAx::kRxBufSize &&
+                  PcieDmaAx::kFwcmdSlotStride >= PcieDmaAx::kFwcmdSlotSize,
+              "a stride must hold its object");
+
+/* Slab layout offsets. Each area starts on a multiple of its power-of-two
+ * stride, so no object straddles a chunk at least as large as that stride. */
 struct Layout {
   size_t txbd, rxq_bd, rpq_bd, rxq_buf, rpq_buf, wd, payload, fwcmd, total;
 };
 Layout layout() {
+  size_t end = 0;
+  auto area = [&end](size_t stride, size_t count) {
+    const size_t align = stride > PAGE_SZ ? stride : PAGE_SZ;
+    const size_t start = (end + align - 1) & ~(align - 1);
+    end = start + stride * count;
+    return start;
+  };
   Layout l{};
-  l.txbd = 0;
-  l.rxq_bd = l.txbd + page_align(PcieDmaAx::kTxChannels * PcieDmaAx::kBdLen * BD_SZ);
-  l.rpq_bd = l.rxq_bd + page_align(PcieDmaAx::kBdLen * BD_SZ);
-  l.rxq_buf = l.rpq_bd + page_align(PcieDmaAx::kBdLen * BD_SZ);
-  l.rpq_buf = l.rxq_buf + page_align(static_cast<size_t>(PcieDmaAx::kBdLen) *
-                                     PcieDmaAx::kRxBufSize);
-  l.wd = l.rpq_buf + page_align(static_cast<size_t>(PcieDmaAx::kBdLen) *
-                                PcieDmaAx::kRxBufSize);
-  l.payload = l.wd + page_align(static_cast<size_t>(PcieDmaAx::kWdPages) *
-                                PcieDmaAx::kWdPageSize);
-  l.fwcmd = l.payload + page_align(static_cast<size_t>(PcieDmaAx::kWdPages) *
-                                   PcieDmaAx::kPayloadSize);
-  l.total = l.fwcmd + page_align(static_cast<size_t>(PcieDmaAx::kBdLen) *
-                                 PcieDmaAx::kFwcmdSlotSize);
+  /* First, so that it gets the slab's lowest memory: see low_slab_bytes. */
+  l.payload = area(PcieDmaAx::kPayloadSize, PcieDmaAx::kWdPages);
+  l.txbd = area(RING_BYTES, PcieDmaAx::kTxChannels);
+  l.rxq_bd = area(RING_BYTES, 1);
+  l.rpq_bd = area(RING_BYTES, 1);
+  l.rxq_buf = area(PcieDmaAx::kRxBufStride, PcieDmaAx::kBdLen);
+  l.rpq_buf = area(PcieDmaAx::kRxBufStride, PcieDmaAx::kBdLen);
+  l.wd = area(PcieDmaAx::kWdPageSize, PcieDmaAx::kWdPages);
+  l.fwcmd = area(PcieDmaAx::kFwcmdSlotStride, PcieDmaAx::kBdLen);
+  l.total = page_align(end);
   return l;
 }
 
@@ -137,13 +145,61 @@ PcieDmaAx::PcieDmaAx(PcieTransport &t, Logger_t logger, int rx_poll_us)
 
 size_t PcieDmaAx::slab_bytes() const { return layout().total; }
 
-bool PcieDmaAx::attach(uint8_t *slab, uint64_t slab_iova) {
+unsigned PcieDmaAx::dma_address_bits() const { return pcie_ax::kAddressBits; }
+
+/* The frame payloads. Unlike everything else they must stay below 4 GiB: the
+ * chip does not follow the high address bits of a WD page's entries. */
+size_t PcieDmaAx::low_slab_bytes() const {
   const Layout l = layout();
+  return l.payload + static_cast<size_t>(kPayloadSize) * kWdPages;
+}
+
+std::vector<DmaQuiesceOp> PcieDmaAx::quiesce_ops() const {
+  /* HalKestrel::pcie_ctrl_dma_all(false), then the stop bit of every channel. */
+  namespace r = kestrel::reg;
+  return {
+      {r::R_AX_HAXI_INIT_CFG1, r::B_AX_STOP_AXI_MST, true},
+      {r::R_AX_HAXI_INIT_CFG1, r::B_AX_TXHCI_EN_V1 | r::B_AX_RXHCI_EN_V1, false},
+      {r::R_AX_HAXI_DMA_STOP1,
+       r::HAXI_DMA_STOP1_CHANS | r::B_AX_STOP_WPDMA | r::B_AX_STOP_PCIEIO, true},
+      {r::R_AX_HAXI_DMA_STOP2, r::HAXI_DMA_STOP2_CHANS, true},
+  };
+}
+
+bool PcieDmaAx::attach(const DmaSlab &dma) {
+  const Layout l = layout();
+  if (dma.len < l.total ||
+      (dma.chunk_bytes && dma.chunk_bytes % kRxBufStride != 0)) {
+    _logger->error("PcieDmaAx: DMA slab unusable ({} B in {} B chunks, need {} "
+                   "B in multiples of {} B)",
+                   dma.len, dma.chunk_bytes, l.total, kRxBufStride);
+    return false;
+  }
+  const size_t chunk_span = dma.chunk_bytes ? dma.chunk_bytes : dma.len;
+  for (const uint64_t base : dma.chunk_iova) {
+    if (base + chunk_span > pcie_ax::kAddressLimit) {
+      _logger->error("PcieDmaAx: DMA slab at 0x{:x} is beyond the {} address "
+                     "bits the descriptors carry",
+                     base, pcie_ax::kAddressBits);
+      return false;
+    }
+  }
+  for (uint32_t page = 0; page < kWdPages; page++) {
+    const uint64_t at =
+        dma.iova(l.payload + static_cast<size_t>(page) * kPayloadSize);
+    if (at + kPayloadSize > pcie_ax::kLowAddressLimit) {
+      _logger->error("PcieDmaAx: frame payload at 0x{:x} is not below 4 GiB",
+                     at);
+      return false;
+    }
+  }
+  _slab = dma;
+  uint8_t *const slab = dma.va;
   for (uint32_t ch = 0; ch < kTxChannels; ch++) {
     TxRing &r = _tx[ch];
-    const size_t off = l.txbd + static_cast<size_t>(ch) * kBdLen * BD_SZ;
+    const size_t off = l.txbd + static_cast<size_t>(ch) * RING_BYTES;
     r.bd = slab + off;
-    r.bd_iova = slab_iova + off;
+    r.bd_iova = dma.iova(off);
     r.wp = 0;
     r.reg_num = kTxCh[ch].num;
     r.reg_idx = kTxCh[ch].idx;
@@ -153,16 +209,16 @@ bool PcieDmaAx::attach(uint8_t *slab, uint64_t slab_iova) {
               (static_cast<uint32_t>(kTxCh[ch].bd_min) << 16);
   }
   _rxq.bd = slab + l.rxq_bd;
-  _rxq.bd_iova = slab_iova + l.rxq_bd;
+  _rxq.bd_iova = dma.iova(l.rxq_bd);
   _rxq.bufs = slab + l.rxq_buf;
-  _rxq.bufs_iova = slab_iova + l.rxq_buf;
+  _rxq.bufs_off = l.rxq_buf;
   _rxq.reg_num = R_RXQ_NUM;
   _rxq.reg_idx = R_RXQ_IDX;
   _rxq.reg_desa_l = R_RXQ_DESA_L;
   _rpq.bd = slab + l.rpq_bd;
-  _rpq.bd_iova = slab_iova + l.rpq_bd;
+  _rpq.bd_iova = dma.iova(l.rpq_bd);
   _rpq.bufs = slab + l.rpq_buf;
-  _rpq.bufs_iova = slab_iova + l.rpq_buf;
+  _rpq.bufs_off = l.rpq_buf;
   _rpq.reg_num = R_RPQ_NUM;
   _rpq.reg_idx = R_RPQ_IDX;
   _rpq.reg_desa_l = R_RPQ_DESA_L;
@@ -171,11 +227,11 @@ bool PcieDmaAx::attach(uint8_t *slab, uint64_t slab_iova) {
     arm_rx_bd(_rpq, i);
   }
   _wd_pages = slab + l.wd;
-  _wd_pages_iova = slab_iova + l.wd;
+  _wd_off = l.wd;
   _payload = slab + l.payload;
-  _payload_iova = slab_iova + l.payload;
+  _payload_off = l.payload;
   _fwcmd = slab + l.fwcmd;
-  _fwcmd_iova = slab_iova + l.fwcmd;
+  _fwcmd_off = l.fwcmd;
   _free_pages.clear();
   _free_pages.reserve(kWdPages);
   for (uint32_t i = kWdPages; i-- > 0;)
@@ -187,8 +243,7 @@ bool PcieDmaAx::attach(uint8_t *slab, uint64_t slab_iova) {
 void PcieDmaAx::arm_rx_bd(RxRing &r, uint32_t idx) {
   bd_write(r.bd + static_cast<size_t>(idx) * BD_SZ,
            static_cast<uint16_t>(kRxBufSize), 0,
-           static_cast<uint32_t>(r.bufs_iova +
-                                 static_cast<uint64_t>(idx) * kRxBufSize));
+           _slab.iova(r.bufs_off + static_cast<size_t>(idx) * kRxBufStride));
 }
 
 uint32_t PcieDmaAx::hw_idx(uint16_t reg_idx) {
@@ -209,23 +264,28 @@ uint32_t PcieDmaAx::hw_idx(uint16_t reg_idx) {
 }
 
 void PcieDmaAx::setup_rings() {
-  /* rtw89_pci_reset_trx_rings: per TX channel num + BDRAM + desa_l (desa_h
-   * never written), per RX ring num + desa_l; host indices to 0. The index
-   * registers themselves were cleared by the HAL's clr_idx_all just before. */
+  /* rtw89_pci_reset_trx_rings: per TX channel num + BDRAM + ring base, per RX
+   * ring num + ring base; host indices to 0. The index registers themselves
+   * were cleared by the HAL's clr_idx_all just before. */
   std::lock_guard<std::mutex> lk(_pool_mu);
+  /* desa_h sits right after desa_l in every bank. */
+  auto write_ring_base = [this](uint16_t reg_desa_l, uint64_t iova) {
+    _t.mmio_write<uint32_t>(reg_desa_l, static_cast<uint32_t>(iova));
+    _t.mmio_write<uint32_t>(reg_desa_l + 4u, static_cast<uint32_t>(iova >> 32));
+  };
   for (uint32_t ch = 0; ch < kTxChannels; ch++) {
     TxRing &r = _tx[ch];
     r.wp = 0;
     _t.mmio_write<uint16_t>(r.reg_num, static_cast<uint16_t>(kBdLen & IDX_MASK));
     _t.mmio_write<uint32_t>(r.reg_bdram, r.bdram);
-    _t.mmio_write<uint32_t>(r.reg_desa_l, static_cast<uint32_t>(r.bd_iova));
+    write_ring_base(r.reg_desa_l, r.bd_iova);
   }
   for (RxRing *r : {&_rxq, &_rpq}) {
     r->wp = 0;
     for (uint32_t i = 0; i < kBdLen; i++)
       arm_rx_bd(*r, i);
     _t.mmio_write<uint16_t>(r->reg_num, static_cast<uint16_t>(kBdLen & IDX_MASK));
-    _t.mmio_write<uint32_t>(r->reg_desa_l, static_cast<uint32_t>(r->bd_iova));
+    write_ring_base(r->reg_desa_l, r->bd_iova);
   }
   /* Every page is free again: the DMA engine was stopped + index-cleared
    * before this, so nothing in flight can still name an old page. */
@@ -238,7 +298,7 @@ void PcieDmaAx::setup_rings() {
   std::atomic_thread_fence(std::memory_order_seq_cst);
   _logger->info("PcieDmaAx: rings programmed (13 TX × {} BDs, RXQ/RPQ {} × "
                 "{} B, {} WD pages @ IOVA 0x{:x})",
-                kBdLen, kBdLen, kRxBufSize, kWdPages, _wd_pages_iova);
+                kBdLen, kBdLen, kRxBufSize, kWdPages, _slab.iova(_wd_off));
 }
 
 bool PcieDmaAx::ring_has_room(const TxRing &r, int ch) {
@@ -307,11 +367,11 @@ int PcieDmaAx::submit_fwcmd(uint8_t *buf, size_t len, int timeout_ms) {
   if (!ring_has_room(r, kFwcmdCh))
     return -1;
   const uint32_t slot = r.wp;
-  uint8_t *dst = _fwcmd + static_cast<size_t>(slot) * kFwcmdSlotSize;
-  std::memcpy(dst, buf, len);
-  const uint64_t iova = _fwcmd_iova + static_cast<uint64_t>(slot) * kFwcmdSlotSize;
+  const size_t slot_off = static_cast<size_t>(slot) * kFwcmdSlotStride;
+  std::memcpy(_fwcmd + slot_off, buf, len);
+  const uint64_t iova = _slab.iova(_fwcmd_off + slot_off);
   bd_write(r.bd + static_cast<size_t>(slot) * BD_SZ, static_cast<uint16_t>(len),
-           TXBD_OPTION_LS, static_cast<uint32_t>(iova));
+           TXBD_OPTION_LS, iova);
   std::atomic_thread_fence(std::memory_order_seq_cst);
   r.wp = (r.wp + 1) % kBdLen;
   _t.mmio_write<uint16_t>(r.reg_idx, static_cast<uint16_t>(r.wp & IDX_MASK));
@@ -367,10 +427,12 @@ int PcieDmaAx::submit_wd(int ch, uint8_t *buf, size_t len, int timeout_ms) {
     _page_busy[page] = true;
   }
 
-  uint8_t *pg = _wd_pages + static_cast<size_t>(page) * kWdPageSize;
-  const uint64_t pg_iova = _wd_pages_iova + static_cast<uint64_t>(page) * kWdPageSize;
-  uint8_t *pl = _payload + static_cast<size_t>(page) * kPayloadSize;
-  const uint64_t pl_iova = _payload_iova + static_cast<uint64_t>(page) * kPayloadSize;
+  const size_t pg_off = static_cast<size_t>(page) * kWdPageSize;
+  const size_t pl_off = static_cast<size_t>(page) * kPayloadSize;
+  uint8_t *pg = _wd_pages + pg_off;
+  const uint64_t pg_iova = _slab.iova(_wd_off + pg_off);
+  uint8_t *pl = _payload + pl_off;
+  const uint64_t pl_iova = _slab.iova(_payload_off + pl_off);
 
   std::memcpy(pl, buf + wd_len, flen);
   std::memset(pg, 0, kWdPageSize);
@@ -390,11 +452,7 @@ int PcieDmaAx::submit_wd(int ch, uint8_t *buf, size_t len, int timeout_ms) {
   for (; n < ADDR_INFO_NR_MAX && remain; n++) {
     const uint32_t chunk = remain > ADDR_INFO_LEN_MAX ? ADDR_INFO_LEN_MAX : remain;
     remain -= chunk;
-    const uint16_t len_opt =
-        static_cast<uint16_t>((chunk & 0x7FF) | (remain == 0 ? ADDR_INFO_LS : 0));
-    wr_le16(ai + 0, len_opt);
-    wr_le16(ai + 2, static_cast<uint16_t>(dma & 0xFFFF));
-    wr_le16(ai + 4, static_cast<uint16_t>((dma >> 16) & 0xFFFF));
+    addr_info_write(ai, chunk, /*last=*/remain == 0, dma);
     dma += chunk;
     ai += ADDR_INFO_SZ;
   }
@@ -412,8 +470,7 @@ int PcieDmaAx::submit_wd(int ch, uint8_t *buf, size_t len, int timeout_ms) {
 
   TxRing &r = _tx[ch];
   bd_write(r.bd + static_cast<size_t>(r.wp) * BD_SZ,
-           static_cast<uint16_t>(page_len), TXBD_OPTION_LS,
-           static_cast<uint32_t>(pg_iova));
+           static_cast<uint16_t>(page_len), TXBD_OPTION_LS, pg_iova);
   std::atomic_thread_fence(std::memory_order_seq_cst);
   r.wp = (r.wp + 1) % kBdLen;
   _t.mmio_write<uint16_t>(r.reg_idx, static_cast<uint16_t>(r.wp & IDX_MASK));
@@ -446,7 +503,7 @@ uint32_t PcieDmaAx::reap_rpq_locked() {
   std::atomic_thread_fence(std::memory_order_acquire);
   uint32_t n = 0;
   while (_rpq.wp != hw && n < kBdLen) {
-    const uint8_t *buf = _rpq.bufs + static_cast<size_t>(_rpq.wp) * kRxBufSize;
+    const uint8_t *buf = _rpq.bufs + static_cast<size_t>(_rpq.wp) * kRxBufStride;
     const uint32_t info = rd_le32(buf);
     const uint32_t blen = info & RXBD_INFO_LEN_MSK;
     const bool fs = info & RXBD_INFO_FS, ls = info & RXBD_INFO_LS;
@@ -484,7 +541,7 @@ uint32_t PcieDmaAx::reap_rxq(
   std::atomic_thread_fence(std::memory_order_acquire);
   uint32_t n = 0;
   while (_rxq.wp != hw && n < kBdLen) {
-    const uint8_t *buf = _rxq.bufs + static_cast<size_t>(_rxq.wp) * kRxBufSize;
+    const uint8_t *buf = _rxq.bufs + static_cast<size_t>(_rxq.wp) * kRxBufStride;
     const uint32_t info = rd_le32(buf);
     const uint32_t blen = info & RXBD_INFO_LEN_MSK;
     const bool fs = info & RXBD_INFO_FS, ls = info & RXBD_INFO_LS;

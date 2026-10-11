@@ -143,7 +143,14 @@ size_t PcieDma88xx::slab_bytes() const {
   return page_align(off_rxbuf + static_cast<size_t>(rxn) * _rx_buf_size);
 }
 
-bool PcieDma88xx::attach(uint8_t *slab, uint64_t slab_iova) {
+bool PcieDma88xx::attach(const DmaSlab &dma) {
+  /* The bounce buffers and RX buffers here are laid out for one bus run. */
+  if (dma.chunk_bytes != 0) {
+    _logger->error("PcieDma88xx: a chunked DMA slab is not supported");
+    return false;
+  }
+  uint8_t *const slab = dma.va;
+  const uint64_t slab_iova = dma.iova(0);
   const uint32_t rxn = _rx_ring_len;
   size_t off_txbd = 0;
   size_t off_bounce = off_txbd + Q_MAX * PAGE_SZ;

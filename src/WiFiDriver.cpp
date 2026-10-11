@@ -379,8 +379,7 @@ std::unique_ptr<IRadio> WiFiDriver::CreateRadioPcie(
 
   /* Chip identity from SYS_CFG2 (0x00FC) over BAR2 MMIO — the same dispatch
    * signal the USB factory reads via a vendor control transfer. */
-  const uint8_t chip_id =
-      *reinterpret_cast<volatile uint8_t *>(transport->mmio() + 0x00FC);
+  const uint8_t chip_id = transport->mmio_read<uint8_t>(0x00FC);
 
   if (chip_id == kChipId8821C) {
 #if defined(DEVOURER_HAVE_JAGUAR2_8821C)

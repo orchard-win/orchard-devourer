@@ -32,7 +32,8 @@ option(DEVOURER_8733B         "RTL8731BU / RTL8733BU USB support"               
 # src/kestrel/CLAUDE.md).
 option(DEVOURER_KESTREL_8852B "RTL8852BU / 8832BU (Kestrel 11ax, G6)"           ON)
 option(DEVOURER_KESTREL_8852C "RTL8852CU / 8832CU (Kestrel 11ax, G6)"           ON)
-# PCIe transport (vfio-pci). Linux-only. One transport, two DMA planes chosen
+# PCIe transport (vfio-pci on Linux, a register proxy driver on Windows, where
+# only the AX plane is ported). One transport, two DMA planes chosen
 # by PCI device id: the HalMAC-generation 88xx buffer-descriptor rings (the
 # RTL8821CE on the Jaguar2 HAL) and the AX HAXI TXBD/WD-page + RXQ/RPQ rings
 # (the RTL8852CE on the Kestrel HAL). Each plane compiles with its chip group,
@@ -43,7 +44,9 @@ option(DEVOURER_KESTREL_8852C "RTL8852CU / 8832CU (Kestrel 11ax, G6)"           
 # parts (RTL8812AE/8821AE) CANNOT — pre-HalMAC silicon with the older
 # rtlwifi-style own-bit descriptor DMA, a different engine.
 # OFF by default — libusb-only builds are bit-identical.
-option(DEVOURER_PCIE          "PCIe transport via vfio-pci (Linux; RTL8821CE, RTL8852CE)"  OFF)
+option(DEVOURER_PCIE          "PCIe transport (Linux vfio-pci: RTL8821CE, RTL8852CE; Windows register proxy: RTL8852CE)"  OFF)
+set(DEVOURER_REGPROXY_INCLUDE_DIR "" CACHE PATH
+    "Windows PCIe only: directory holding the register proxy driver's regproxy_ioctl.h")
 # MediaTek MT7612U / MT7662U — the first non-Realtek part. Compiles the
 # src/mt7612u subtree (its own C++ library with a C ABI, landed unwired in #412)
 # into libdevourer along with Mt7612uRadio, the IRadio backend WiFiDriver
@@ -110,8 +113,22 @@ if(NOT DEVOURER_JAGUAR1 AND NOT DEVOURER_JAGUAR2 AND NOT DEVOURER_JAGUAR3
         "/ DEVOURER_KESTREL_8852C.")
 endif()
 if(DEVOURER_PCIE)
-    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        message(FATAL_ERROR "DEVOURER_PCIE=ON requires Linux (vfio-pci).")
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32)
+        message(FATAL_ERROR
+            "DEVOURER_PCIE=ON requires Linux (vfio-pci) or Windows (register proxy).")
+    endif()
+    if(WIN32)
+        if(NOT DEVOURER_KESTREL_8852C)
+            message(FATAL_ERROR
+                "DEVOURER_PCIE=ON on Windows requires DEVOURER_KESTREL_8852C=ON: "
+                "only the AX plane is ported there (the 88xx plane waits on an "
+                "eventfd).")
+        endif()
+        if(NOT EXISTS "${DEVOURER_REGPROXY_INCLUDE_DIR}/regproxy_ioctl.h")
+            message(FATAL_ERROR
+                "DEVOURER_PCIE=ON on Windows needs DEVOURER_REGPROXY_INCLUDE_DIR "
+                "pointing at the register proxy driver's regproxy_ioctl.h.")
+        endif()
     endif()
     if(NOT DEVOURER_JAGUAR2_8821C AND NOT DEVOURER_KESTREL_8852C)
         message(FATAL_ERROR
@@ -413,12 +430,26 @@ if(DEVOURER_MT7612U)
     target_compile_definitions(devourer PUBLIC DEVOURER_HAVE_MT7612U=1)
 endif()
 
-# --- PCIe transport (vfio-pci; see src/PcieTransport.h) ---
+# sleep_for cannot wait less than a scheduler tick on Windows.
+target_sources(devourer PRIVATE src/PreciseDelay.h)
+if(WIN32)
+    target_sources(devourer PRIVATE src/PreciseDelayWin.cpp)
+endif()
+
+# --- PCIe transport (one host backend per OS; see src/PcieTransport.h) ---
 if(DEVOURER_PCIE)
     target_sources(devourer PRIVATE
         src/PcieTransport.cpp src/PcieTransport.h src/PcieDmaPlane.h
         src/PcieDmaUtil.h)
-    if(DEVOURER_JAGUAR2_8821C)
+    if(WIN32)
+        target_sources(devourer PRIVATE src/PcieTransportWin.cpp)
+        target_include_directories(devourer PRIVATE
+            "${DEVOURER_REGPROXY_INCLUDE_DIR}")
+        target_link_libraries(devourer PUBLIC setupapi)
+    else()
+        target_sources(devourer PRIVATE src/PcieTransportVfio.cpp)
+    endif()
+    if(DEVOURER_JAGUAR2_8821C AND NOT WIN32)
         target_sources(devourer PRIVATE src/PcieDma88xx.cpp src/PcieDma88xx.h)
     endif()
     if(DEVOURER_KESTREL_8852C)
@@ -619,7 +650,7 @@ endif()
 # pcieprobe — staged PCIe bring-up driver for the RTL8821CE / RTL8852CE
 # milestones (id/MMIO sanity -> power-on + EFUSE -> firmware download). rxdemo's
 # DEVOURER_PCIE_BDF branch is the full-RX consumer; this probe validates the
-# layers below it one at a time. Linux/vfio only.
+# layers below it one at a time.
 if(DEVOURER_PCIE)
     add_executable(pcieprobe
         examples/pcieprobe/main.cpp
@@ -630,7 +661,7 @@ endif()
 # kestrel_tbtt_probe — bench probe for the AX beacon TBTT vs port-TSF semantics
 # (two RTL8852CEs: one beacons, the other reads the on-air egress TSF). The
 # ground truth behind Kestrel's PinBeaconTbtt.
-if(DEVOURER_PCIE AND DEVOURER_KESTREL_8852C)
+if(DEVOURER_PCIE AND DEVOURER_KESTREL_8852C AND NOT WIN32)
     add_executable(kestrel_tbtt_probe
         tests/kestrel_tbtt_probe.cpp
     )
@@ -638,7 +669,7 @@ if(DEVOURER_PCIE AND DEVOURER_KESTREL_8852C)
 endif()
 # pcie_ptp_tsf_discipline — the AP-beacon → PTP loop for TSF-locked-TBTT parts
 # (actuator = the TSF itself); sibling of tests/pcie_ptp_beacon.cpp.
-if(DEVOURER_PCIE)
+if(DEVOURER_PCIE AND NOT WIN32)
     add_executable(pcie_ptp_tsf_discipline
         tests/pcie_ptp_tsf_discipline.cpp
     )

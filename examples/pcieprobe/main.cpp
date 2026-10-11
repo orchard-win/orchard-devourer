@@ -38,16 +38,6 @@
 #include "kestrel/ChipVariant.h"
 #include "kestrel/HalKestrel.h"
 #endif
-#include <fstream>
-
-/* PCI device id from sysfs — the AX dies dispatch id-first (kestrel/CLAUDE.md:
- * 0x00FC is R_AX_SYS_CHIPINFO there, not the Jaguar chip-id). */
-static uint16_t pci_device_id(const std::string &bdf) {
-  std::ifstream f("/sys/bus/pci/devices/" + bdf + "/device");
-  unsigned v = 0;
-  f >> std::hex >> v;
-  return static_cast<uint16_t>(v);
-}
 
 #if defined(DEVOURER_HAVE_KESTREL_8852C)
 /* RTL8852CE (Kestrel, AX): M0 die-id + cut, M1 = HalKestrel PCIe power-on
@@ -189,8 +179,11 @@ int main(int argc, char **argv) {
   }
 
   /* ---- stage id (M0): pure MMIO register plane, no power, no DMA ---- */
+  /* The AX dies dispatch id-first (kestrel/CLAUDE.md: 0x00FC is
+   * R_AX_SYS_CHIPINFO there, not the Jaguar chip-id). */
+  const uint16_t pci_did = transport->pci_device_id();
   RtlAdapter adapter(transport, logger, {});
-  if (pci_device_id(bdf) == 0xC852) {
+  if (pci_did == 0xC852) {
 #if defined(DEVOURER_HAVE_KESTREL_8852C)
     return probe_8852c(adapter, logger, want);
 #else
@@ -200,7 +193,7 @@ int main(int argc, char **argv) {
   }
 #if !defined(DEVOURER_HAVE_JAGUAR2_8821C)
   logger->error("PCI device {:04x} is not an RTL8852CE and 8821C support is not "
-                "compiled in", pci_device_id(bdf));
+                "compiled in", pci_did);
   return 1;
 #else
   const uint8_t chip_id = adapter.rtw_read8(0x00FC);

@@ -60,12 +60,19 @@ public:
   static constexpr uint32_t kRxBufSize = 11496;  /* RTW89_PCI_RX_BUF_SIZE 11494, 8-aligned */
   static constexpr uint32_t kPayloadSize = 4096; /* per-page frame bounce */
   static constexpr uint32_t kFwcmdSlotSize = 2304; /* rxd 16 + fwcmd hdr 8 + 2020 section, rounded */
+  /* Slab spacing of RX buffers and fwcmd slots: the next power of two above
+   * their size, so that no object straddles a chunk of a chunked DmaSlab. */
+  static constexpr uint32_t kRxBufStride = 16384;
+  static constexpr uint32_t kFwcmdSlotStride = 4096;
 
   PcieDmaAx(PcieTransport &t, Logger_t logger, int rx_poll_us);
 
   const char *name() const override { return "ax-haxi"; }
   size_t slab_bytes() const override;
-  bool attach(uint8_t *slab_va, uint64_t slab_iova) override;
+  unsigned dma_address_bits() const override;
+  size_t low_slab_bytes() const override;
+  bool attach(const DmaSlab &slab) override;
+  std::vector<DmaQuiesceOp> quiesce_ops() const override;
   void setup_rings() override;
   int tx_submit(uint8_t hint, uint8_t *buf, size_t len,
                 int timeout_ms) override;
@@ -91,8 +98,8 @@ private:
   struct RxRing {
     volatile uint8_t *bd = nullptr; /* kBdLen × 8 B */
     uint64_t bd_iova = 0;
-    uint8_t *bufs = nullptr; /* kBdLen × kRxBufSize */
-    uint64_t bufs_iova = 0;
+    uint8_t *bufs = nullptr; /* kBdLen buffers, kRxBufStride apart */
+    size_t bufs_off = 0;     /* slab offset of bufs */
     uint32_t wp = 0;
     uint16_t reg_num = 0, reg_idx = 0, reg_desa_l = 0;
   };
@@ -117,18 +124,22 @@ private:
   std::array<TxRing, kTxChannels> _tx{};
   RxRing _rxq{}, _rpq{};
 
-  /* WD page pool: page VA/IOVA + its payload bounce; freed by RPP seq. */
+  /* Bus addresses come from the slab per object: it may be chunked. */
+  DmaSlab _slab;
+
+  /* WD page pool: page VA + slab offset, and its payload bounce; freed by RPP
+   * seq. */
   uint8_t *_wd_pages = nullptr;
-  uint64_t _wd_pages_iova = 0;
+  size_t _wd_off = 0;
   uint8_t *_payload = nullptr;
-  uint64_t _payload_iova = 0;
+  size_t _payload_off = 0;
   std::vector<uint16_t> _free_pages;       /* LIFO of free page indices */
   std::array<bool, kWdPages> _page_busy{}; /* in flight until its RPP */
   mutable std::mutex _pool_mu;             /* pool + RPQ ring state + _rpp */
   std::array<std::mutex, kTxChannels> _tx_mu; /* per-channel ring state */
 
-  uint8_t *_fwcmd = nullptr; /* kBdLen × kFwcmdSlotSize bounce ring (CH12) */
-  uint64_t _fwcmd_iova = 0;
+  uint8_t *_fwcmd = nullptr; /* kBdLen slots, kFwcmdSlotStride apart (CH12) */
+  size_t _fwcmd_off = 0;
 
   std::vector<uint8_t> _rx_assembly; /* FS..LS spanning reassembly */
   bool _rx_assembling = false;

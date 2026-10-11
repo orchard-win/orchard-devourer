@@ -81,7 +81,8 @@ the TP-Link TX50UH is RTL8832**C**U (8852C-family) despite lab lore calling it
 supported, RTL8733B**S** is the SDIO sibling and has no transport here. Full
 chip / bench-throughput table: README **Supported hardware**.
 
-**PCIe** (`DEVOURER_PCIE=ON`, Linux-only, default OFF): two parts ride their
+**PCIe** (`DEVOURER_PCIE=ON`, default OFF; Linux, and Windows as described
+after this paragraph): two parts ride their
 USB siblings' HALs unchanged through one vfio-pci transport
 (`src/PcieTransport.{h,cpp}`: BAR2 MMIO registers, the caller owns vfio like
 it owns libusb). The RTL8821CE (PCIe 8821CU) is the Jaguar2 HAL over the
@@ -115,6 +116,24 @@ tests/pcie_rx_smoke.py` (ambient beacons, either part) and
 `tests/pcie_8852ce_onair.sh` (the 8852CE cell matrix against a USB 8852C
 witness: usb→pcie, pcie→usb, pcie→pcie, exact per-direction hit counts).
 
+**PCIe on Windows** (`src/PcieTransportWin.cpp`, RTL8852CE only): there is no
+vfio, so registers go through a user-mode register proxy driver bound to the
+card (the winawdl project's; its IOCTL contract is `regproxy_ioctl.h`, found
+through `DEVOURER_REGPROXY_INCLUDE_DIR`) and the DMA slab is locked 2 MiB
+blocks whose physical addresses are handed to the chip as bus addresses. The
+slab is therefore chunked (`DmaSlab::chunk_bytes`): no DMA object may straddle
+a block. Nothing remaps or fences that DMA, so the transport gives the driver
+the plane's `quiesce_ops()` to replay if the process dies. Addresses are 36-bit
+as in rtw89 (`src/PcieDmaAxDesc.h`), measured working for the ring bases, the
+buffer descriptors and receive, and measured NOT working for a WD page's
+address entries: with the frame payloads above 4 GiB peers stopped answering
+although every frame was reported sent, so the plane keeps that one area low
+(`low_slab_bytes()`). Config space is out of reach from user mode there, so
+bus mastering and ASPM stay as Windows set them. `sleep_for` rounds up to the
+scheduler tick (15.6 ms) on Windows, which turned register polls into
+multi-second waits; the HAL's short delays go through `src/PreciseDelay.h`.
+One machine, one card: none of this is validated on a second system.
+
 ## Build
 
 ```sh
@@ -132,8 +151,8 @@ Per-chip options, all default ON: `DEVOURER_JAGUAR1`, `DEVOURER_8814` (requires
 JAGUAR1), `DEVOURER_JAGUAR2_8822B`, `DEVOURER_JAGUAR2_8821C`,
 `DEVOURER_JAGUAR3_8822C`, `DEVOURER_JAGUAR3_8822E`, `DEVOURER_8733B`,
 `DEVOURER_KESTREL_8852B`, `DEVOURER_KESTREL_8852C`.
-`DEVOURER_PCIE` (default OFF, Linux-only, requires
-JAGUAR2_8821C) adds the vfio-pci transport + `pcieprobe`; OFF builds are
+`DEVOURER_PCIE` (default OFF; on Linux it requires JAGUAR2_8821C, on Windows
+KESTREL_8852C) adds the PCIe transport + `pcieprobe`; OFF builds are
 byte-identical to before it existed. Turning groups off drops their firmware
 blobs + PHY tables (an 8812AU-only `rxdemo` is ~1.6 MB vs ~6.3 MB all-on — the
 verbatim-vendored Kestrel halbb/halrf plane dominates the difference).

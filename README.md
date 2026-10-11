@@ -225,8 +225,9 @@ All chips compile in by default; per-chip CMake options (`DEVOURER_JAGUAR1`,
 tables — an 8812AU-only
 `rxdemo` is ~1.6 MB against ~6.3 MB with everything on, and dropping just the
 two Wi-Fi 6 dies takes it to ~4.2 MB (their verbatim-vendored halbb/halrf plane
-is the single largest contributor). `DEVOURER_PCIE` (default OFF, Linux-only)
-adds the vfio-pci transport for the RTL8821CE and RTL8852CE.
+is the single largest contributor). `DEVOURER_PCIE` (default OFF) adds the
+PCIe transport: vfio-pci on Linux for the RTL8821CE and RTL8852CE, and a
+register proxy driver on Windows for the RTL8852CE.
 
 ## Using the library
 

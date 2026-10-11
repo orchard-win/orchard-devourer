@@ -15,8 +15,31 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 namespace devourer {
+
+/* DMA memory handed to a plane. With chunk_bytes set it is bus-contiguous only
+ * inside a chunk, and no DMA object may straddle a chunk boundary. */
+struct DmaSlab {
+  uint8_t *va = nullptr;
+  size_t len = 0;
+  size_t chunk_bytes = 0;
+  std::vector<uint64_t> chunk_iova;
+
+  uint64_t iova(size_t off) const {
+    return chunk_bytes ? chunk_iova[off / chunk_bytes] + off % chunk_bytes
+                       : chunk_iova[0] + off;
+  }
+};
+
+/* A register bit operation that stops a plane's DMA engine, for a host that
+ * can replay it if the process dies with DMA live. */
+struct DmaQuiesceOp {
+  uint32_t reg;
+  uint32_t bits;
+  bool set; /* false = clear */
+};
 
 class IPcieDmaPlane {
 public:
@@ -26,10 +49,20 @@ public:
 
   /* DMA slab bytes this plane needs (rings + buffers). Called before attach. */
   virtual size_t slab_bytes() const = 0;
-  /* Carve the slab (VA + its IOVA, both page-aligned) into rings/buffers and
-   * arm the RX descriptors. Register programming is NOT done here — that is
-   * setup_rings(), which runs at the generation's intf_pre_init slot. */
-  virtual bool attach(uint8_t *slab_va, uint64_t slab_iova) = 0;
+  /* Width of the bus addresses this plane can hand the chip. Every address
+   * in the slab must fit. */
+  virtual unsigned dma_address_bits() const { return 32; }
+  /* How many leading bytes of the slab must lie below 4 GiB even when
+   * dma_address_bits() allows more. */
+  virtual size_t low_slab_bytes() const { return 0; }
+  /* Carve the slab into rings/buffers and arm the RX descriptors. Register
+   * programming is NOT done here — that is setup_rings(), which runs at the
+   * generation's intf_pre_init slot. Returns false for a slab layout the
+   * plane cannot use (a chunked slab on a plane that needs one run). */
+  virtual bool attach(const DmaSlab &slab) = 0;
+
+  /* 32-bit register operations that stop this plane's DMA, in order. */
+  virtual std::vector<DmaQuiesceOp> quiesce_ops() const { return {}; }
 
   /* Program the ring base/num/index registers and reset the host indices
    * (rtw88 rtw_pci_reset_buf_desc / rtw89 rtw89_pci_reset_trx_rings). Where

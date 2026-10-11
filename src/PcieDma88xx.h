@@ -38,7 +38,7 @@ public:
 
   const char *name() const override { return "88xx-bd"; }
   size_t slab_bytes() const override;
-  bool attach(uint8_t *slab_va, uint64_t slab_iova) override;
+  bool attach(const DmaSlab &slab) override;
   void setup_rings() override;
   int tx_submit(uint8_t hint, uint8_t *buf, size_t len,
                 int timeout_ms) override;

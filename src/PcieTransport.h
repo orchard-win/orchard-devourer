@@ -1,19 +1,31 @@
 #pragma once
 
-/* PcieTransport — vfio-pci userspace transport for the PCIe Realtek parts
- * (RTL8821CE on the Jaguar2 HAL; RTL8852CE on the Kestrel HAL).
+/* PcieTransport — userspace transport for the PCIe Realtek parts (RTL8821CE on
+ * the Jaguar2 HAL; RTL8852CE on the Kestrel HAL).
  *
- * The caller owns vfio, mirroring the USB doctrine ("the caller owns libusb"):
- * PcieTransport::Open(bdf) is the recommended open path — it walks
- * /sys/bus/pci/devices/<bdf>/iommu_group, opens the vfio container + group,
- * maps BAR2 (the MMIO window exposing the same register space the USB
+ * This class is the bus-neutral half. What reaches the device is a host
+ * backend, one per file, chosen at build time:
+ *
+ *   PcieTransportVfio.cpp (Linux): the caller owns vfio, mirroring the USB
+ *   doctrine ("the caller owns libusb"). Open(bdf) walks
+ *   /sys/bus/pci/devices/<bdf>/iommu_group, opens the vfio container + group,
+ *   maps BAR2, enables PCI bus mastering, and DMA-maps one anonymous slab at a
+ *   chosen IOVA. The device must already be bound to vfio-pci
+ *   (tests/pcie_vfio_bind.sh).
+ *
+ *   PcieTransportWin.cpp (Windows): the card is bound to a user-mode register
+ *   proxy driver that relays register accesses; the DMA slab is locked 2 MiB
+ *   blocks owned by this process, whose physical addresses are used as bus
+ *   addresses. Config space is out of reach there, so bus mastering and ASPM
+ *   stay as the OS left them. RTL8852CE only.
+ *
+ * BAR2 is the MMIO window exposing the same register space the USB
  * vendor-control path addresses: 64 KiB on the 11ac parts, 1 MiB on the AX
  * parts, where the halbb/halrf BB window above 0x10000 is directly
- * addressable), enables PCI bus mastering, and DMA-maps one anonymous slab
- * for the rings + buffers. The device must already be bound to vfio-pci
- * (tests/pcie_vfio_bind.sh).
+ * addressable.
  *
- * Registers: plain volatile loads/stores on the BAR2 mapping.
+ * Registers: one aligned access at a time through the backend (a volatile
+ * load/store on the BAR2 mapping under vfio).
  *
  * Frames: the DMA engine differs per generation and lives behind
  * IPcieDmaPlane (src/PcieDmaPlane.h), chosen from the PCI device id at
@@ -46,7 +58,7 @@ public:
      * 256-entry rings, 11494-byte RX buffers, 512 WD pages). */
     uint32_t rx_ring_len = 512;   /* RTK_MAX_RX_DESC_NUM */
     uint32_t rx_buf_size = 11480; /* RTK_PCI_RX_BUF_SIZE (11478) 8-aligned */
-    uint64_t iova_base = 0x10000000; /* slab IOVA; must stay < 4 GiB */
+    uint64_t iova_base = 0x10000000; /* vfio slab IOVA; must stay < 4 GiB */
     int rx_poll_us = 200;            /* RX hw-index poll interval */
     /* MSI-via-eventfd RX wakeups (VFIO_DEVICE_SET_IRQS) on a plane that
      * consumes them (the 88xx plane; the AX plane polls and never registers
@@ -57,12 +69,14 @@ public:
     bool use_msi = true;
   };
 
-  /* Open the vfio-pci device at `bdf` ("0000:01:00.0"). Returns null and logs
-   * on any failure (group not viable, BAR2 map failed, DMA map failed, no DMA
-   * plane for this device id...). Bus mastering + ASPM-off +
-   * completion-timeout-disable are applied here. (Two overloads instead of a
-   * defaulted Config arg: a nested class with default member initializers
-   * cannot be a default argument inside its own enclosing class.) */
+  /* Open the device at `bdf` ("0000:01:00.0"). Returns null and logs on any
+   * failure (group not viable, BAR2 map failed, DMA map failed, no DMA plane
+   * for this device id...). Under vfio, bus mastering + ASPM-off +
+   * completion-timeout-disable are applied here. On Windows `bdf` only labels
+   * log lines: the one card bound to the proxy driver is opened. (Two
+   * overloads instead of a defaulted Config arg: a nested class with default
+   * member initializers cannot be a default argument inside its own enclosing
+   * class.) */
   static std::shared_ptr<PcieTransport> Open(const std::string &bdf,
                                              Logger_t logger,
                                              const Config &cfg);
@@ -113,20 +127,19 @@ public:
    * it is per generation (Jaguar2: before power-on; Kestrel: after
    * dmac_func_pre_en, before FWDL). */
   void hci_setup() override { _dma->setup_rings(); }
-  /* Live DEVCTL2 LTR_EN read through the vfio config region (see ITransport).
-   * False when the PCIe capability is missing or unreadable — silence is the
-   * safe side. */
+  /* Live DEVCTL2 LTR_EN read from config space (see ITransport). False when
+   * the PCIe capability is missing or unreadable — silence is the safe
+   * side. */
   bool ltr_allowed() override;
   TxStats tx_stats() const override;
 
-  volatile uint8_t *mmio() const { return _mmio; }
   size_t mmio_len() const { return _mmio_len; }
   /* PCI config-space identity (the AX parts dispatch on the device id — their
    * 0x00FC byte is R_AX_SYS_CHIPINFO, not a Jaguar chip-id). */
   uint16_t pci_vendor_id() const { return _pci_vid; }
   uint16_t pci_device_id() const { return _pci_did; }
 
-  /* ---- PCI config space (via the vfio config region) ---- */
+  /* ---- PCI config space (false where the host backend cannot reach it) ---- */
   bool cfg_read(uint32_t off, void *buf, size_t len);
   bool cfg_write(uint32_t off, const void *buf, size_t len);
 
@@ -151,7 +164,7 @@ public:
       return 0;
     }
     if ((off & (sizeof(T) - 1)) == 0)
-      return *reinterpret_cast<volatile T *>(_mmio + off);
+      return static_cast<T>(reg_read(off, sizeof(T)));
     return static_cast<T>(read_split(off, sizeof(T)));
   }
   template <typename T> void mmio_write(uint32_t off, T v) {
@@ -160,25 +173,35 @@ public:
       return;
     }
     if ((off & (sizeof(T) - 1)) == 0) {
-      *reinterpret_cast<volatile T *>(_mmio + off) = v;
+      reg_write(off, sizeof(T), static_cast<uint32_t>(v));
       return;
     }
     write_split(off, sizeof(T), static_cast<uint32_t>(v));
   }
-  int msi_fd() const { return _msi_evt; }
+  /* eventfd signalled per MSI; -1 = polling mode. */
+  int msi_fd() const;
   const Config &config() const { return _cfg; }
   const std::string &bdf() const { return _bdf; }
   IPcieDmaPlane &dma_plane() { return *_dma; }
 
 private:
-  PcieTransport(Logger_t logger, Config cfg) : _logger(std::move(logger)), _cfg(cfg) {}
+  struct Os; /* host backend state, defined in its .cpp */
 
-  bool open_vfio(const std::string &bdf);
-  bool map_bar2();
+  PcieTransport(Logger_t logger, Config cfg);
+
+  /* ---- host backend (PcieTransportVfio.cpp / PcieTransportWin.cpp) ---- */
+  /* Reach the device and its registers; sets _mmio_len. */
+  bool open_device(const std::string &bdf);
+  /* Sets _pci_vid/_pci_did; applies what config-space setup the host allows. */
   bool setup_config_space();
-  bool select_dma_plane();
+  /* Allocates the slab the plane asked for and attaches the plane to it. */
   bool init_dma();
   bool setup_msi();
+  /* One naturally aligned register access of 1, 2 or 4 bytes. */
+  uint32_t reg_read(uint32_t off, size_t width);
+  void reg_write(uint32_t off, size_t width, uint32_t v);
+
+  bool select_dma_plane();
   void warn_oob(uint32_t off);
 
   template <typename T> T guarded_read(uint16_t reg) {
@@ -205,16 +228,10 @@ private:
   std::string _bdf;
   uint16_t _pci_vid = 0, _pci_did = 0;
 
-  int _container = -1, _group = -1, _device = -1;
-  int _msi_evt = -1;        /* eventfd signalled per MSI; -1 = polling mode */
-  volatile uint8_t *_mmio = nullptr;
+  std::unique_ptr<Os> _os;
   size_t _mmio_len = 0;
-  uint64_t _cfg_region_off = 0;
   uint32_t _pcie_cap = 0; /* PCI Express capability offset (0 = not found) */
-  size_t _cfg_region_len = 0;
-
-  uint8_t *_slab = nullptr; /* DMA slab VA (anonymous, VFIO-pinned) */
-  size_t _slab_len = 0;
+  DmaSlab _slab;          /* memory owned by _os */
 
   /* TX submission counters (TxStats.h contract, like the USB transport). */
   std::atomic<uint64_t> _tx_submitted{0};
