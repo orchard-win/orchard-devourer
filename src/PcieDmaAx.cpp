@@ -175,6 +175,13 @@ bool PcieDmaAx::attach(const DmaSlab &dma) {
                    dma.len, dma.chunk_bytes, l.total, kRxBufStride);
     return false;
   }
+  /* Only the frame payloads may sit in a head of smaller chunks. */
+  if (dma.head_bytes && (dma.head_bytes != low_slab_bytes() ||
+                         dma.head_chunk_bytes % kPayloadSize != 0)) {
+    _logger->error("PcieDmaAx: DMA slab head unusable ({} B in {} B chunks)",
+                   dma.head_bytes, dma.head_chunk_bytes);
+    return false;
+  }
   const size_t chunk_span = dma.chunk_bytes ? dma.chunk_bytes : dma.len;
   for (const uint64_t base : dma.chunk_iova) {
     if (base + chunk_span > pcie_ax::kAddressLimit) {

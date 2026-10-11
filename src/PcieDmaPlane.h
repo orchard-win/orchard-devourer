@@ -20,14 +20,22 @@
 namespace devourer {
 
 /* DMA memory handed to a plane. With chunk_bytes set it is bus-contiguous only
- * inside a chunk, and no DMA object may straddle a chunk boundary. */
+ * inside a chunk, and no DMA object may straddle a chunk boundary. With
+ * head_bytes set, that many leading bytes come in smaller chunks of their own
+ * and chunk_iova describes what follows them. */
 struct DmaSlab {
   uint8_t *va = nullptr;
   size_t len = 0;
   size_t chunk_bytes = 0;
   std::vector<uint64_t> chunk_iova;
+  size_t head_bytes = 0;
+  size_t head_chunk_bytes = 0;
+  std::vector<uint64_t> head_iova;
 
   uint64_t iova(size_t off) const {
+    if (off < head_bytes)
+      return head_iova[off / head_chunk_bytes] + off % head_chunk_bytes;
+    off -= head_bytes;
     return chunk_bytes ? chunk_iova[off / chunk_bytes] + off % chunk_bytes
                        : chunk_iova[0] + off;
   }

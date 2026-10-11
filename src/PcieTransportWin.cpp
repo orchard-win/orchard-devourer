@@ -32,6 +32,10 @@ constexpr ULONG_PTR kFrameAt4GiB = ULONG_PTR{1} << (32 - kPageShift);
  * keep the lowest. The last attempt takes every free large page. */
 constexpr size_t kOverRequest[] = {4, 16};
 constexpr size_t kRequestEverything = 4096;
+/* Single pages come from anywhere too, and few of them from below 4 GiB:
+ * how many to ask for, in turn, when some must be that low. */
+constexpr size_t kPageRequests[] = {size_t{1} << 15, size_t{1} << 17,
+                                    size_t{1} << 19};
 
 using AllocatePages2Fn = BOOL(WINAPI *)(HANDLE, PULONG_PTR, PULONG_PTR,
                                         PMEM_EXTENDED_PARAMETER, ULONG);
@@ -72,6 +76,16 @@ std::vector<ULONG_PTR> allocate_blocks(size_t count) {
   return frames;
 }
 
+/* Allocates up to `count` locked 4 KiB pages and returns their frames. */
+std::vector<ULONG_PTR> allocate_pages(size_t count) {
+  std::vector<ULONG_PTR> frames(count);
+  ULONG_PTR got = count;
+  if (!AllocateUserPhysicalPages(GetCurrentProcess(), &got, frames.data()))
+    got = 0;
+  frames.resize(got);
+  return frames;
+}
+
 void free_blocks(std::vector<ULONG_PTR> &frames) {
   ULONG_PTR count = frames.size();
   if (count)
@@ -91,8 +105,9 @@ uint16_t instance_id_field(const wchar_t *instance_id, const wchar_t *key) {
 
 struct PcieTransport::Os {
   HANDLE proxy = INVALID_HANDLE_VALUE;
-  uint8_t *slab = nullptr;          /* one MEM_PHYSICAL view over all blocks */
-  std::vector<ULONG_PTR> blocks;    /* first frame of each mapped block */
+  uint8_t *slab = nullptr;          /* one MEM_PHYSICAL view over all of it */
+  std::vector<ULONG_PTR> head;      /* frames of single pages mapped first */
+  std::vector<ULONG_PTR> blocks;    /* first frame of each block mapped next */
   std::vector<REGPROXY_OP> quiesce; /* stops the plane's DMA engine */
   std::atomic<bool> io_error_logged{false};
 };
@@ -114,11 +129,12 @@ PcieTransport::~PcieTransport() {
                     nullptr, 0, &returned, nullptr);
   }
   if (_os->slab) {
-    for (size_t i = 0; i < _os->blocks.size(); i++)
-      MapUserPhysicalPages(_os->slab + i * kBlockBytes, kPagesPerBlock,
-                           nullptr);
+    MapUserPhysicalPages(_os->slab,
+                         _os->head.size() + _os->blocks.size() * kPagesPerBlock,
+                         nullptr);
     VirtualFree(_os->slab, 0, MEM_RELEASE);
   }
+  free_blocks(_os->head);
   free_blocks(_os->blocks);
   if (_os->proxy != INVALID_HANDLE_VALUE)
     CloseHandle(_os->proxy);
@@ -263,10 +279,42 @@ bool PcieTransport::init_dma() {
     if (!_os->blocks.empty())
       break;
   }
+  /* A low block can be missing where low pages are not: the part that must
+   * be low is then made of those, and only the rest of blocks. */
+  const size_t head_pages = low_need * kPagesPerBlock;
+  if (_os->blocks.empty() && low_need) {
+    for (size_t request : requests) {
+      std::vector<ULONG_PTR> frames = allocate_blocks(request);
+      _os->blocks = take_lowest_blocks(frames, need - low_need, kPagesPerBlock,
+                                       limit_frame);
+      free_blocks(frames);
+      if (!_os->blocks.empty())
+        break;
+    }
+    _logger->info("PcieTransport: no 2 MiB block is free below 4 GiB; {} of "
+                  "the {} other blocks found",
+                  _os->blocks.size(), need - low_need);
+    for (size_t request : kPageRequests) {
+      if (_os->blocks.empty() || !_os->head.empty())
+        break;
+      std::vector<ULONG_PTR> frames = allocate_pages(request);
+      const auto low = std::count_if(
+          frames.begin(), frames.end(),
+          [](ULONG_PTR frame) { return frame < kFrameAt4GiB; });
+      _logger->info("PcieTransport: of {} single pages, {} are below 4 GiB "
+                    "({} wanted)",
+                    frames.size(), low, head_pages);
+      _os->head = take_lowest_blocks(frames, head_pages, 1, kFrameAt4GiB);
+      free_blocks(frames);
+    }
+    if (_os->head.empty())
+      free_blocks(_os->blocks);
+  }
   if (_os->blocks.empty()) {
     _logger->error("PcieTransport: could not get {} locked 2 MiB blocks within "
-                   "{} address bits, {} of them below 4 GiB — free memory is "
-                   "too fragmented; try after a reboot",
+                   "{} address bits with {} of them, or as many single pages, "
+                   "below 4 GiB — free memory is too fragmented; try after a "
+                   "reboot",
                    need, address_bits, low_need);
     return false;
   }
@@ -279,14 +327,21 @@ bool PcieTransport::init_dma() {
                    GetLastError());
     return false;
   }
+  const size_t head_len = _os->head.size() * kPageBytes;
+  if (!_os->head.empty() &&
+      !MapUserPhysicalPages(_os->slab, _os->head.size(), _os->head.data())) {
+    _logger->error("PcieTransport: mapping the slab's low pages failed ({})",
+                   GetLastError());
+    return false;
+  }
   /* A block maps as its 512 consecutive 4 KiB frames; the documented large
    * page flags are refused for AWE views. */
   std::vector<ULONG_PTR> pages(kPagesPerBlock);
-  for (size_t i = 0; i < need; i++) {
+  for (size_t i = 0; i < _os->blocks.size(); i++) {
     for (size_t page = 0; page < kPagesPerBlock; page++)
       pages[page] = _os->blocks[i] + page;
-    if (!MapUserPhysicalPages(_os->slab + i * kBlockBytes, kPagesPerBlock,
-                              pages.data())) {
+    if (!MapUserPhysicalPages(_os->slab + head_len + i * kBlockBytes,
+                              kPagesPerBlock, pages.data())) {
       _logger->error("PcieTransport: mapping slab block {} failed ({})", i,
                      GetLastError());
       return false;
@@ -300,6 +355,11 @@ bool PcieTransport::init_dma() {
   _slab.chunk_iova.clear();
   for (ULONG_PTR frame : _os->blocks)
     _slab.chunk_iova.push_back(static_cast<uint64_t>(frame) * kPageBytes);
+  _slab.head_bytes = head_len;
+  _slab.head_chunk_bytes = kPageBytes;
+  _slab.head_iova.clear();
+  for (ULONG_PTR frame : _os->head)
+    _slab.head_iova.push_back(static_cast<uint64_t>(frame) * kPageBytes);
   if (!_dma->attach(_slab))
     return false;
 
@@ -323,9 +383,10 @@ bool PcieTransport::init_dma() {
     return false;
   }
   _logger->info("PcieTransport: DMA slab is {} locked 2 MiB blocks, physical "
-                "0x{:x}..0x{:x}, used as bus addresses",
-                need, _slab.chunk_iova.front(),
-                _slab.chunk_iova.back() + kBlockBytes);
+                "0x{:x}..0x{:x}, and {} single pages below 4 GiB, used as bus "
+                "addresses",
+                _os->blocks.size(), _slab.chunk_iova.front(),
+                _slab.chunk_iova.back() + kBlockBytes, _os->head.size());
   return true;
 }
 
