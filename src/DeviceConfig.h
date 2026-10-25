@@ -388,6 +388,11 @@ struct DeviceConfig {
     int kestrel_fastretune_ofld = 1;
     // Experimental B MAC/PTA only; firmware BTC/RFK bridge is not ported.
     bool kestrel_hardware_pta = false;
+    /* Experimental: create the RTL8852BE over PCIe (Orchard's TX20E port) and
+     * let it take a station identity. Its bring-up, RX, TX, an AP's ACK and
+     * the DMA stop are measured on one card; its ACK of a peer's unicast is
+     * not. Set by the caller only, no env. */
+    bool kestrel_be_pcie = false;
     /* env: DEVOURER_FW_TABLE_OFLD — Jaguar2 init-time firmware register
      * IO-offload (HalMAC cfg_param): route the static BB/AGC/RF phy-table write
      * stream through one FW_OFFLOAD/CFG_PARAM H2C per ~160-command batch that

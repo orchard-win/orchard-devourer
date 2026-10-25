@@ -190,6 +190,32 @@ bool RtlKestrelDevice::PowerOnFwAndTrx(kestrel::EfuseInfo &out) {
   return _hal.read_efuse(out);
 }
 
+bool RtlKestrelDevice::PowerOnFwAndTrxBe(kestrel::EfuseInfo &out) {
+  /* rtw89's order, as Orchard's hardware probe ran it on the TX20E: the
+   * probe-time partial init (power-on with the first settings, FWDL, the
+   * efuse, stop and power-off), then the start with the efuse's settings
+   * (HalKestrel::read_efuse keeps them for the next power-on). */
+  const bool read = PowerOnEfuseAndFw(out);
+  const auto stop = _hal.shutdown_be(true);
+  if (!read || !stop.stopped || !stop.powered_off)
+    return false;
+  /* The PCIe block's ids are the decoded map's self-check. */
+  if (out.pci_vid != 0x10ec || out.pci_did != 0xb852) {
+    _logger->error("Kestrel: BE efuse PCI ids {:04x}:{:04x} are not 10ec:b852 "
+                   "— the map was misread",
+                   out.pci_vid, out.pci_did);
+    return false;
+  }
+  if (!_hal.power_on() || !_hal.download_firmware(_hal.read_cut()) ||
+      !_hal.enable_bb_rf())
+    return false;
+  _hal.mac_sys_init();
+  if (!_hal.trx_dmac_init() || !_hal.trx_cmac_rx_init() || !_hal.intf_init())
+    return false;
+  _hal.fw_err_state("post-mac-hal-init");
+  return true;
+}
+
 bool RtlKestrelDevice::PowerOnTrxAndPhy(kestrel::EfuseInfo &out) {
   if (!PowerOnFwAndTrx(out))
     return false;
@@ -206,8 +232,9 @@ bool RtlKestrelDevice::BringUpMonitor(SelectedChannel channel) {
   _channel = channel;
   /* hal_start_8852b order (rtl8852b_halinit.c:508): mac_hal_init [pwr ->
    * FWDL -> enable_bb_rf -> sys_init -> trx_init -> intf_init] -> efuse ->
-   * BB/RF tables -> channel. */
-  if (!PowerOnFwAndTrx(_efuse))
+   * BB/RF tables -> channel. The 8852BE runs rtw89's two passes instead. */
+  const bool be = !_device.is_usb() && _variant == kestrel::ChipVariant::C8852B;
+  if (!(be ? PowerOnFwAndTrxBe(_efuse) : PowerOnFwAndTrx(_efuse)))
     return false;
   if (!_hal.phy_bb_rf_init(_efuse.rfe_type, _hal.read_cut()))
     return false;
@@ -886,12 +913,19 @@ bool RtlKestrelDevice::SendTrigger(const devourer::TriggerConfig &cfg) {
 
 bool RtlKestrelDevice::SetStationIdentity(const devourer::MacAddr &own,
                                           const devourer::MacAddr &bssid) {
-  if (!_tx_up || _variant != kestrel::ChipVariant::C8852C || _device.is_usb()) {
-    _logger->error("Kestrel: SetStationIdentity needs an RTL8852CE after "
-                   "InitWrite");
+  /* PCIe only: the 8852CE as measured, the 8852BE as Orchard ported it
+   * (Linux's 8852B rate checks; the factory makes one only on request). */
+  if (!_tx_up || _device.is_usb()) {
+    _logger->error("Kestrel: SetStationIdentity needs an RTL8852CE or "
+                   "RTL8852BE after InitWrite");
     return false;
   }
   _station_identity = _hal.set_station_identity(own.data(), bssid.data());
+  /* The 8852BE stays in sniffer mode: with it off, an AWDL session on the
+   * TX20E heard the peers' action frames but none of their data. The 8852C
+   * sweep found sniffer mode made no difference to the ACK. */
+  if (_station_identity && _variant == kestrel::ChipVariant::C8852B)
+    _hal.set_rx_sniffer(true);
   _own = own;
   _bssid = bssid;
   return _station_identity;
@@ -1064,6 +1098,15 @@ devourer::AdapterCaps RtlKestrelDevice::GetAdapterCaps() {
    * active beacon's TBTT with it (on-air, tests/kestrel_tbtt_probe.cpp). */
   c.tbtt_follows_tsf = !_device.is_usb();
   c.xtal_cap_default = _efuse.xtal_cap; /* efuse crystal-cap (no runtime trim wired) */
+  /* station_mode_ok: the RTL8852BE on Orchard's experimental path only. Its
+   * cell (Orchard probe, TX20E): an AP ACKed 8/8 probe requests and its
+   * responses to the station address were received. One AWDL session (an
+   * iPhone's AirDrop to it, sniffer mode kept): 367 of 2318 unicast data
+   * frames to the station address carried the retry flag, where the 8852C
+   * saw 81-86% without its ACK. No no-ACK control on this card, so the flag
+   * stays the caller's acceptance. */
+  c.station_mode_ok = _variant == kestrel::ChipVariant::C8852B &&
+                      !_device.is_usb() && _cfg.tuning.kestrel_be_pcie;
   devourer::set_standard_freq_ranges(c);
 
   if (_variant == kestrel::ChipVariant::C8852C) {

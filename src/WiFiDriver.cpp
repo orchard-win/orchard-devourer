@@ -355,12 +355,27 @@ std::unique_ptr<IRadio> WiFiDriver::CreateRadioPcie(
   if (auto kvariant = kestrel::variant_for_pci_id(transport->pci_vendor_id(),
                                                   transport->pci_device_id())) {
     if (*kvariant != kestrel::ChipVariant::C8852C) {
-      _logger->error("PCI {:04x}:{:04x} at {} is an RTL8852BE: only its "
-                     "power-on and firmware download are ported, not the "
-                     "live bring-up — refusing",
-                     transport->pci_vendor_id(), transport->pci_device_id(),
-                     transport->bdf());
+      if (!cfg.tuning.kestrel_be_pcie) {
+        _logger->error("PCI {:04x}:{:04x} at {} is an RTL8852BE: its live "
+                       "PCIe path is experimental (DeviceConfig::tuning."
+                       "kestrel_be_pcie) — refusing",
+                       transport->pci_vendor_id(), transport->pci_device_id(),
+                       transport->bdf());
+        return nullptr;
+      }
+#if defined(DEVOURER_HAVE_KESTREL_8852B)
+      _logger->warn("Creating RtlKestrelDevice C8852B over PCIe ({}; PCI "
+                    "{:04x}:{:04x}) — experimental",
+                    transport->bdf(), transport->pci_vendor_id(),
+                    transport->pci_device_id());
+      return std::make_unique<RtlKestrelDevice>(
+          RtlAdapter(std::move(transport), _logger, cfg), _logger,
+          kestrel::ChipVariant::C8852B, cfg);
+#else
+      _logger->error("RTL8852BE detected but 8852B support not compiled in "
+                     "(DEVOURER_KESTREL_8852B=OFF)");
       return nullptr;
+#endif
     }
 #if defined(DEVOURER_HAVE_KESTREL_8852C)
     _logger->info("Creating RtlKestrelDevice C8852C over PCIe ({}; PCI "

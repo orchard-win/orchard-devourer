@@ -660,6 +660,17 @@ HalKestrel::BeShutdown HalKestrel::shutdown_be(bool drain_rx) {
     _logger->error("Kestrel: shutdown_be is ported for the 8852BE only");
     return result;
   }
+  if (!_be_powered && !_be_pcie_prepared) {
+    /* Nothing started here. A MAC that is off runs no DMA, and its DMA
+     * registers do not answer: on the TX20E the stop failed at 0x8410 when
+     * nothing had powered the MAC. One left on by someone else is stopped. */
+    const uint32_t state = _device.rtw_read32(0x03f0); /* power state [9:8] */
+    if (state != 0xffffffffu && state != 0xeaeaeaeau && ((state >> 8) & 3) != 1) {
+      _device.set_dma_state(devourer::DmaState::stopped);
+      result.stopped = result.powered_off = true;
+      return result;
+    }
+  }
   if (drain_rx && _be_pcie_prepared) {
     /* Hand the RX and release-report buffers back before the stop. A full RX
      * ring alone did not hold the stop on hardware (DMA_BUSY1 stayed 0); the
@@ -1809,6 +1820,14 @@ bool HalKestrel::clear_station_identity(const uint8_t inject_sa[6]) {
   set32(r::R_AX_CCA_CONTROL, r::B_AX_SIFS_CHK_BTCCA);
   set32(r::R_AX_TRXPTCL_RESP_0, r::B_AX_RSP_CHK_BTCCA);
   return ok;
+}
+
+void HalKestrel::set_rx_sniffer(bool on) {
+  namespace r = kestrel::reg;
+  if (on)
+    set32(r::R_AX_RX_FLTR_OPT, r::B_AX_SNIFFER_MODE);
+  else
+    clr32(r::R_AX_RX_FLTR_OPT, r::B_AX_SNIFFER_MODE);
 }
 
 void HalKestrel::sch_tx_en() {

@@ -241,6 +241,10 @@ public:
   /* kestrelprobe "trx" stage: everything in "fw" plus the DMAC-half MAC TRX
    * init. Returns false at the first failing step. */
   bool PowerOnFwAndTrx(kestrel::EfuseInfo &out);
+  /* The same for the RTL8852BE over PCIe in rtw89's two passes: the probe-time
+   * partial init (FWDL, efuse, stop, power-off), then the start with the
+   * efuse's power settings. BringUpMonitor takes this one for that card. */
+  bool PowerOnFwAndTrxBe(kestrel::EfuseInfo &out);
 
   /* kestrelprobe "phy" stage: everything in "trx" plus the BB + RF table
    * apply. Returns false at the first failing step. */

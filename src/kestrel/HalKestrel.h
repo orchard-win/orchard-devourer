@@ -314,6 +314,8 @@ public:
   bool set_station_identity(const uint8_t own[6], const uint8_t bssid[6]);
   /* Back to `inject_sa` with no link, sniffer mode and the Bluetooth wait. */
   bool clear_station_identity(const uint8_t inject_sa[6]);
+  /* Sniffer mode alone: every frame to the host, whatever the address filter. */
+  void set_rx_sniffer(bool on);
   /* After set_station_identity: names `peer` in the address CAM entry of
    * macid 0 and opens a BA CAM entry for its A-MPDUs on `tid`. */
   bool accept_block_ack(const uint8_t own[6], const uint8_t bssid[6],
