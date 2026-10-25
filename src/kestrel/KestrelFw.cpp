@@ -101,8 +101,11 @@ bool KestrelFw::dle_init_dlfw() {
       c ? r::DLFW_WDE_UNLNK_PAGE_8852C : r::DLFW_WDE_UNLNK_PAGE;
   const uint16_t ple_free =
       c ? r::DLFW_PLE_FREE_PAGE_8852C : r::DLFW_PLE_FREE_PAGE;
-  const uint16_t wde_wcpu =
-      c ? r::DLFW_WDE_WCPU_MIN_8852C : r::DLFW_WDE_WCPU_MIN;
+  /* The SCC override is per bus: the 8852BE takes its PCIe SCC row's WCPU
+   * quota (rtw89 wde_qt7), 48 pages. */
+  const uint16_t wde_wcpu = c       ? r::DLFW_WDE_WCPU_MIN_8852C
+                            : _pcie ? 48
+                                    : r::DLFW_WDE_WCPU_MIN;
   const uint16_t ple_c2h_min = c ? r::DLFW_PLE_C2H_MIN_8852C : r::DLFW_PLE_C2H;
   const uint16_t ple_c2h_max = c ? r::DLFW_PLE_C2H_MAX_8852C : r::DLFW_PLE_C2H;
   const uint16_t ple_h2c = c ? r::DLFW_PLE_H2C_8852C : r::DLFW_PLE_H2C;
@@ -189,13 +192,14 @@ bool KestrelFw::hfc_init_dlfw() {
    * The 8852C PCIe DLFW pre-cost is 256 pages (hfc_preccfg_pcie_dlfw_8852c),
    * the USB one 32. */
   const uint16_t h2c_prec =
-      _pcie ? r::HFC_PCIE_DLFW_H2C_PREC_8852C : r::HFC_USB_H2C_PREC_8852B;
+      _pcie ? (c ? r::HFC_PCIE_DLFW_H2C_PREC_8852C : 40) : r::HFC_USB_H2C_PREC_8852B;
   _device.rtw_write32(
       page_ctrl, (static_cast<uint32_t>(h2c_prec & r::B_AX_PREC_PAGE_CH12_MSK)
                   << r::B_AX_PREC_PAGE_CH12_SH));
   _device.rtw_write32(
       fc_ctrl,
-      r::set_clr_word(_device.rtw_read32(fc_ctrl), r::HFC_FULL_COND_X2,
+      r::set_clr_word(_device.rtw_read32(fc_ctrl),
+                      (_pcie && !c) ? r::HFC_FULL_COND_X1 : r::HFC_FULL_COND_X2,
                       r::B_AX_HCI_FC_CH12_FULL_COND_MSK,
                       r::B_AX_HCI_FC_CH12_FULL_COND_SH));
   /* set_fc_func_en(0, 1): clear FC_EN, set CH12_EN. */
@@ -491,15 +495,19 @@ bool KestrelFw::fw_ba_cam(uint8_t macid, uint8_t tid, uint16_t ssn,
   /* A closing command carries the macid and the entry index only. INIT_REQ
    * has the hardware start its window at `ssn`; STD_EN marks a static entry. */
   uint32_t w0 = static_cast<uint32_t>(macid) << r::H2C_BA_CAM_W0_MACID_SH;
-  uint32_t w1 = static_cast<uint32_t>(entry_idx & 0xf)
-                << r::H2C_BA_CAM_W1_ENTRY_IDX_SH;
+  const bool b = _variant == ChipVariant::C8852B;
+  if (b && entry_idx >= 2) return false; // B has two static BA CAM entries.
+  uint32_t w1 = 0;
+  if (b) w0 |= static_cast<uint32_t>(entry_idx) << 2; // BACAM_V0
+  else w1 = static_cast<uint32_t>(entry_idx & 0xf)
+            << r::H2C_BA_CAM_W1_ENTRY_IDX_SH; // BACAM_V0_EXT
   if (valid) {
     const uint32_t bmap = buffer_size > 64 ? r::H2C_BA_CAM_BMAP_OVER_64 : 0;
     w0 |= r::H2C_BA_CAM_W0_VALID | r::H2C_BA_CAM_W0_INIT_REQ |
           (static_cast<uint32_t>(tid & 0xf) << r::H2C_BA_CAM_W0_TID_SH) |
           (bmap << r::H2C_BA_CAM_W0_BMAP_SIZE_SH) |
           (static_cast<uint32_t>(ssn & 0xfff) << r::H2C_BA_CAM_W0_SSN_SH);
-    w1 |= r::H2C_BA_CAM_W1_STD_EN;
+    if (!b) w1 |= r::H2C_BA_CAM_W1_STD_EN;
   }
   uint8_t c[8];
   put_le32(c + 0, w0);
@@ -769,8 +777,8 @@ void KestrelFw::idmem_share_mode_check() {
     v = r::set_clr_word(v, mode, r::B_SEC_IDMEM_SIZE_CONFIG_MSK,
                         r::B_SEC_IDMEM_SIZE_CONFIG_SH);
     _device.rtw_write32(r::R_AX_SEC_CTRL, v);
-    _logger->info("Kestrel FWDL: IDMEM share -> 0x{:x} (SEC_CTRL=0x{:08x})", mode,
-                  v);
+    _logger->info("Kestrel FWDL: IDMEM share 0x{:x} -> 0x{:x} (SEC_CTRL=0x{:08x})",
+                  cur, mode, v);
   }
 }
 

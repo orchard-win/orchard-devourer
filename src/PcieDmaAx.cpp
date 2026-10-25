@@ -1,4 +1,5 @@
 #include "PcieDmaAx.h"
+#include "rtl8852be.h"
 
 #include <chrono>
 #include <cstdio>
@@ -136,7 +137,7 @@ Layout layout() {
 PcieDmaAx::PcieDmaAx(PcieTransport &t, Logger_t logger, int rx_poll_us,
                      bool quick_submit)
     : _t(t), _logger(std::move(logger)), _rx_poll_us(rx_poll_us),
-      _quick_submit(quick_submit) {
+      _be(t.pci_device_id() == 0xb852), _quick_submit(quick_submit) {
   static_assert(WD_BODY_LEN_V1 + WD_INFO_LEN + WP_INFO_SZ +
                         ADDR_INFO_NR_MAX * ADDR_INFO_SZ <=
                     kWdPageSize,
@@ -147,18 +148,23 @@ PcieDmaAx::PcieDmaAx(PcieTransport &t, Logger_t logger, int rx_poll_us,
 
 size_t PcieDmaAx::slab_bytes() const { return layout().total; }
 
-unsigned PcieDmaAx::dma_address_bits() const { return pcie_ax::kAddressBits; }
+unsigned PcieDmaAx::dma_address_bits() const { return _be ? orchard::rtl8852be::dma_address_bits : pcie_ax::kAddressBits; }
 
 /* The frame payloads. Unlike everything else they must stay below 4 GiB: the
  * chip does not follow the high address bits of a WD page's entries. */
 size_t PcieDmaAx::low_slab_bytes() const {
   const Layout l = layout();
+  if (_be) return l.total;
   return l.payload + static_cast<size_t>(kPayloadSize) * kWdPages;
 }
 
 std::vector<DmaQuiesceOp> PcieDmaAx::quiesce_ops() const {
   /* HalKestrel::pcie_ctrl_dma_all(false), then the stop bit of every channel. */
   namespace r = kestrel::reg;
+  if (_be) return {
+      {0x1010, orchard::rtl8852be::active_stop_mask | (1u << 19) | (1u << 20), true},
+      {0x1000, (1u << 11) | (1u << 13), false},
+  };
   return {
       {r::R_AX_HAXI_INIT_CFG1, r::B_AX_STOP_AXI_MST, true},
       {r::R_AX_HAXI_INIT_CFG1, r::B_AX_TXHCI_EN_V1 | r::B_AX_RXHCI_EN_V1, false},
@@ -178,7 +184,7 @@ bool PcieDmaAx::attach(const DmaSlab &dma) {
     return false;
   }
   /* Only the frame payloads may sit in a head of smaller chunks. */
-  if (dma.head_bytes && (dma.head_bytes != low_slab_bytes() ||
+  if (dma.head_bytes && (_be || dma.head_bytes != low_slab_bytes() ||
                          dma.head_chunk_bytes % kPayloadSize != 0)) {
     _logger->error("PcieDmaAx: DMA slab head unusable ({} B in {} B chunks)",
                    dma.head_bytes, dma.head_chunk_bytes);
@@ -186,10 +192,11 @@ bool PcieDmaAx::attach(const DmaSlab &dma) {
   }
   const size_t chunk_span = dma.chunk_bytes ? dma.chunk_bytes : dma.len;
   for (const uint64_t base : dma.chunk_iova) {
-    if (base + chunk_span > pcie_ax::kAddressLimit) {
+    if (base >= (uint64_t{1} << dma_address_bits()) ||
+        chunk_span > (uint64_t{1} << dma_address_bits()) - base) {
       _logger->error("PcieDmaAx: DMA slab at 0x{:x} is beyond the {} address "
                      "bits the descriptors carry",
-                     base, pcie_ax::kAddressBits);
+                     base, dma_address_bits());
       return false;
     }
   }
@@ -205,6 +212,7 @@ bool PcieDmaAx::attach(const DmaSlab &dma) {
   _slab = dma;
   uint8_t *const slab = dma.va;
   for (uint32_t ch = 0; ch < kTxChannels; ch++) {
+    if (_be && !orchard::rtl8852be::active_channel(ch)) continue;
     TxRing &r = _tx[ch];
     const size_t off = l.txbd + static_cast<size_t>(ch) * RING_BYTES;
     r.bd = slab + off;
@@ -212,6 +220,13 @@ bool PcieDmaAx::attach(const DmaSlab &dma) {
     r.wp = 0;
     r.hw_seen = 0;
     r.told = 0;
+    if (_be) {
+      const auto& b = orchard::rtl8852be::tx_rings[ch];
+      r.reg_num = b.count; r.reg_idx = b.index;
+      r.reg_bdram = b.bdram; r.reg_desa_l = b.base;
+      r.bdram = b.start | (uint32_t{b.maximum} << 8) | (uint32_t{b.minimum} << 16);
+      continue;
+    }
     r.reg_num = kTxCh[ch].num;
     r.reg_idx = kTxCh[ch].idx;
     r.reg_bdram = kTxCh[ch].bdram;
@@ -223,16 +238,16 @@ bool PcieDmaAx::attach(const DmaSlab &dma) {
   _rxq.bd_iova = dma.iova(l.rxq_bd);
   _rxq.bufs = slab + l.rxq_buf;
   _rxq.bufs_off = l.rxq_buf;
-  _rxq.reg_num = R_RXQ_NUM;
-  _rxq.reg_idx = R_RXQ_IDX;
-  _rxq.reg_desa_l = R_RXQ_DESA_L;
+  _rxq.reg_num = _be ? 0x1020 : R_RXQ_NUM;
+  _rxq.reg_idx = _be ? 0x1050 : R_RXQ_IDX;
+  _rxq.reg_desa_l = _be ? 0x1100 : R_RXQ_DESA_L;
   _rpq.bd = slab + l.rpq_bd;
   _rpq.bd_iova = dma.iova(l.rpq_bd);
   _rpq.bufs = slab + l.rpq_buf;
   _rpq.bufs_off = l.rpq_buf;
-  _rpq.reg_num = R_RPQ_NUM;
-  _rpq.reg_idx = R_RPQ_IDX;
-  _rpq.reg_desa_l = R_RPQ_DESA_L;
+  _rpq.reg_num = _be ? 0x1022 : R_RPQ_NUM;
+  _rpq.reg_idx = _be ? 0x1054 : R_RPQ_IDX;
+  _rpq.reg_desa_l = _be ? 0x1108 : R_RPQ_DESA_L;
   for (uint32_t i = 0; i < kBdLen; i++) {
     arm_rx_bd(_rxq, i);
     arm_rx_bd(_rpq, i);
@@ -285,6 +300,7 @@ void PcieDmaAx::setup_rings() {
     _t.mmio_write<uint32_t>(reg_desa_l + 4u, static_cast<uint32_t>(iova >> 32));
   };
   for (uint32_t ch = 0; ch < kTxChannels; ch++) {
+    if (_be && !orchard::rtl8852be::active_channel(ch)) continue;
     TxRing &r = _tx[ch];
     r.wp = 0;
     r.hw_seen = 0;
@@ -309,7 +325,7 @@ void PcieDmaAx::setup_rings() {
   _rx_assembling = false;
   _rx_assembly.clear();
   std::atomic_thread_fence(std::memory_order_seq_cst);
-  _logger->info("PcieDmaAx: rings programmed (13 TX × {} BDs, RXQ/RPQ {} × "
+  _logger->info("PcieDmaAx: rings programmed (active TX × {} BDs, RXQ/RPQ {} × "
                 "{} B, {} WD pages @ IOVA 0x{:x})",
                 kBdLen, kBdLen, kRxBufSize, kWdPages, _slab.iova(_wd_off));
 }
@@ -355,7 +371,7 @@ bool PcieDmaAx::wait_consumed(TxRing &r, int ch, int timeout_ms) {
 
 int PcieDmaAx::tx_submit(uint8_t hint, uint8_t *buf, size_t len,
                          int timeout_ms) {
-  if (hint >= kTxChannels) {
+  if (hint >= kTxChannels || (_be && !orchard::rtl8852be::active_channel(hint))) {
     _logger->error("PcieDmaAx: tx on unknown DMA channel {}", hint);
     return -1;
   }
@@ -372,7 +388,7 @@ int PcieDmaAx::submit_fwcmd(uint8_t *buf, size_t len, int timeout_ms) {
   /* rtw89_pci_fwcmd_submit: the whole [rxd_short 16 B][payload] buffer is the
    * DMA source; one TXBD with LS. The slot is reused once the hardware index
    * has passed it, which the synchronous wait below guarantees. */
-  if (len < 16 || len > kFwcmdSlotSize) {
+  if (len < (_be ? 24u : 16u) || len > kFwcmdSlotSize) {
     _logger->error("PcieDmaAx: fwcmd len {} out of range (16..{})", len,
                    kFwcmdSlotSize);
     return -1;
@@ -395,13 +411,14 @@ int PcieDmaAx::submit_fwcmd(uint8_t *buf, size_t len, int timeout_ms) {
 int PcieDmaAx::submit_wd(int ch, uint8_t *buf, size_t len, int timeout_ms) {
   /* The HAL hands us [wd_body_v1][wd_info if WDINFO_EN][frame] exactly as it
    * would bulk-OUT it on USB. */
-  if (len < WD_BODY_LEN_V1) {
+  const uint32_t body_len = _be ? 24 : WD_BODY_LEN_V1;
+  if (len < body_len) {
     _logger->error("PcieDmaAx: WD buffer too short ({})", len);
     return -1;
   }
   uint32_t dw0 = rd_le32(buf);
   const uint32_t wd_len =
-      WD_BODY_LEN_V1 + ((dw0 & WD_BODY0_WDINFO_EN) ? WD_INFO_LEN : 0);
+      body_len + ((dw0 & WD_BODY0_WDINFO_EN) ? WD_INFO_LEN : 0);
   if (len < wd_len) {
     _logger->error("PcieDmaAx: WD buffer shorter than its descriptor ({} < {})",
                    len, wd_len);
@@ -458,6 +475,18 @@ int PcieDmaAx::submit_wd(int ch, uint8_t *buf, size_t len, int timeout_ms) {
   uint8_t *pl = _payload + pl_off;
   const uint64_t pl_iova = _slab.iova(_payload_off + pl_off);
 
+  uint32_t page_len = 0;
+  if (_be) {
+    page_len = static_cast<uint32_t>(orchard::rtl8852be::make_wd_page(
+        {buf, len}, page, pl_iova, {pg, kWdPageSize}, {pl, kPayloadSize}));
+    if (!page_len) {
+      // Not submitted: safe to return this page immediately (unlike a timeout).
+      std::lock_guard<std::mutex> lk(_pool_mu);
+      _page_busy[page] = false;
+      _free_pages.push_back(page);
+      return -1;
+    }
+  } else {
   std::memcpy(pl, buf + wd_len, flen);
   std::memset(pg, 0, kWdPageSize);
   std::memcpy(pg, buf, wd_len);
@@ -480,7 +509,7 @@ int PcieDmaAx::submit_wd(int ch, uint8_t *buf, size_t len, int timeout_ms) {
     dma += chunk;
     ai += ADDR_INFO_SZ;
   }
-  const uint32_t page_len = wd_len + WP_INFO_SZ + n * ADDR_INFO_SZ;
+  page_len = wd_len + WP_INFO_SZ + n * ADDR_INFO_SZ;
 
   /* wd_body patch: this is a WD page (not an inline frame), no USB
    * store-and-forward, and the addr_info count. WP_OFFSET stays as the HAL
@@ -491,6 +520,8 @@ int PcieDmaAx::submit_wd(int ch, uint8_t *buf, size_t len, int timeout_ms) {
   dw1 = (dw1 & ~(WD_BODY1_ADDR_INFO_NUM_MSK << WD_BODY1_ADDR_INFO_NUM_SH)) |
         ((n & WD_BODY1_ADDR_INFO_NUM_MSK) << WD_BODY1_ADDR_INFO_NUM_SH);
   wr_le32(pg + 4, dw1);
+
+  }
 
   TxRing &r = _tx[ch];
   bd_write(r.bd + static_cast<size_t>(r.wp) * BD_SZ,
@@ -540,7 +571,7 @@ uint32_t PcieDmaAx::reap_rpq_locked() {
     if (fs && ls && blen > 4 && blen <= kRxBufSize) {
       /* rxd (16/32 B) + drv_info, then 4-byte RPP words to the end. */
       kestrel::KestrelRxFrame f{};
-      if (kestrel::parse_rx_8852b(buf + 4, blen - 4, f, DRV_INFO_UNIT_8852C)) {
+      if (kestrel::parse_rx_8852b(buf + 4, blen - 4, f, _be ? orchard::rtl8852be::driver_info_bytes : DRV_INFO_UNIT_8852C)) {
         for (uint32_t off = 0; off + 4 <= f.payload_len; off += 4) {
           const uint32_t rpp = rd_le32(f.payload + off);
           release_page((rpp >> RPP_SEQ_SH) & RPP_SEQ_MSK,
@@ -645,6 +676,11 @@ void PcieDmaAx::rx_loop(
 }
 
 void PcieDmaAx::irq_mask() {
+  if (_be) {
+    for (uint16_t reg : {uint16_t{0x01a0}, uint16_t{0x10b0}, uint16_t{0x13b0}})
+      _t.mmio_write<uint32_t>(reg, 0);
+    return;
+  }
   _t.mmio_write<uint32_t>(R_AX_PCIE_HIMR00_V1, 0);
   _t.mmio_write<uint32_t>(R_AX_HAXI_HIMR00, 0);
 }
@@ -659,6 +695,7 @@ bool PcieDmaAx::tx_kick() {
   for (uint32_t ch = 0; ch < kTxChannels; ch++) {
     if (ch == kFwcmdCh) continue;
     std::lock_guard<std::mutex> lk(_tx_mu[ch]);
+    if (_be && !orchard::rtl8852be::active_channel(ch)) continue;
     TxRing &r = _tx[ch];
     if (r.told == r.wp) continue;
     _t.mmio_write<uint16_t>(r.reg_idx, static_cast<uint16_t>(r.wp & IDX_MASK));

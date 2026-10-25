@@ -60,11 +60,15 @@ bool PcieTransport::select_dma_plane() {
     return false;
 #endif
   case kPciDidRtl8852be:
-    _logger->error("PcieTransport: RTL8852BE ({:04x}:{:04x}) is not ported "
-                   "(its PCIe power sequence and single-BDRAM ring table are "
-                   "unported; the 8852CE is)",
-                   _pci_vid, _pci_did);
+#if defined(DEVOURER_HAVE_KESTREL_8852B)
+    // DMA contract is ported. CreateRadioPcie still refuses live bring-up
+    // until the BE power/PHY lifecycle and station identity have been ported.
+    _dma = std::make_unique<PcieDmaAx>(*this, _logger, _cfg.rx_poll_us, false);
+    return true;
+#else
+    _logger->error("PcieTransport: RTL8852BE needs DEVOURER_KESTREL_8852B=ON");
     return false;
+#endif
   default:
 #if defined(DEVOURER_PCIE_HAVE_88XX)
     /* The HalMAC 88xx ring plane; the factory still checks the chip-id. */

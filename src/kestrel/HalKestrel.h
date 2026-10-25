@@ -10,6 +10,8 @@
 #include "RtlAdapter.h"
 #include "SelectedChannel.h" /* ChannelWidth_t */
 #include "logger.h"
+#include "power.h"
+#include "rtl8852be.h"
 
 struct kestrel_halbb_ctx; /* opaque C handle (hal/halbb/g6) */
 struct kestrel_halrf_ctx; /* opaque C handle (hal/halrf/g6) */
@@ -41,20 +43,28 @@ public:
   /* USB power-on: usb_pre_init + mac_pwr_on_usb_8852b. Leaves the MAC powered
    * (DMAC/CMAC func-enabled) and ready for firmware download. Returns false on
    * a poll timeout (chip wedged — needs a VBUS cold). The 8852C diverges via
-   * power_on_8852c (LDO/SPS/CMAC1/XTAL deltas); the rest is shared. */
+   * power_on_8852c (LDO/SPS/CMAC1/XTAL deltas); the rest is shared.
+   * RTL8852BE (PCIe): Orchard's port of Linux rtw89 (power_on_8852be), with
+   * the efuse's settings once read_efuse has run. */
   bool power_on();
+  /* RTL8852BE (PCIe) only: rtw89_mac_pwr_off. Refused while pcie_pre_init's
+   * DMA is up; pcie_deinit first, as rtw89 runs mac_pre_deinit. */
+  bool power_off();
 
   /* Dump the physical WiFi efuse (register read loop) and parse it to the
    * logical map, filling `out`. Independent of firmware (driver path only).
    * `raw_phys` (optional) receives the 1536-byte physical map for diagnostics.
-   * Must run after power_on (the efuse block is gated by the power sequence). */
+   * Must run after power_on (the efuse block is gated by the power sequence).
+   * RTL8852BE (PCIe): Linux's 1216-byte map and decoding (power.cpp), the
+   * rest of `raw_phys` left 0xFF; keeps the efuse's power-on settings. */
   bool read_efuse(EfuseInfo &out, std::array<uint8_t, 1536> *raw_phys = nullptr);
 
   /* set_enable_bb_rf(1) (hw.c) — release the BB from reset + enable the RF/AFE
    * clocks. The vendor calls this in mac_hal_init right after FWDL and BEFORE
    * sys_init/trx_init, so the BB/RF is live when the firmware starts running.
-   * Must run after download_firmware, before trx_dmac_init. */
-  void enable_bb_rf();
+   * Must run after download_firmware, before trx_dmac_init. False when an XTAL
+   * SI write timed out (the rest still runs, as the vendor's does). */
+  bool enable_bb_rf();
 
   /* Firmware download: hci_func_en + DLE/HFC pre-init + FWDL of the
    * cut-appropriate NICCE image. Must run after power_on. `cut` is the chip
@@ -69,7 +79,7 @@ public:
   /* intf_init: usb_init_8852{b,c} (LFPS filter, RX bulk size, per-endpoint
    * NUMP) on USB; pcie_init (LTR + DMA channel enable + IO release) on PCIe.
    * Vendor order: runs AFTER trx init (+ feat_init, host-side no-op). */
-  void intf_init();
+  bool intf_init();
   void usb_intf_init() { usb_init(); }
 
   /* ---- PCIe (RTL8852CE) host-interface bring-up, mirroring the vendor
@@ -85,10 +95,10 @@ public:
   bool pcie_pre_init();
   /* intf_init: LTR (hardware-decided, 500 us space, 3.2 ms idle timer), open
    * every TX DMA channel, release the WPDMA / PCIe IO stops. */
-  void pcie_init();
+  bool pcie_init();
   /* intf_deinit: LTR off, HAXI DMA stopped, ring indices cleared — run before
    * the transport's DMA slab is unmapped. */
-  void pcie_deinit();
+  bool pcie_deinit();
 
   /* The DMAC half of mac_trx_init: re-init the DLE to the NIC-mode (SCC)
    * quota, station scheduler, MPDU processor, security engine. Must run after
@@ -461,6 +471,16 @@ private:
    * (distinct LDO/SPS/CMAC1/XTAL deltas vs 8852B). power_on() dispatches here
    * for the C8852C variant. */
   bool power_on_8852c();
+  /* rtw89_mac_pwr_on for the RTL8852BE: one attempt, then power-off and one
+   * retry. Linux's first power-on settings until read_efuse has run, then the
+   * efuse's, as rtw89_core_start powers on after the probe. */
+  bool power_on_8852be();
+  /* read_efuse's halves: the vendor dump and parser (USB, 8852C), and Linux's
+   * for the RTL8852BE. Both fill the 2048-byte logical map. */
+  bool read_log_efuse_vendor(std::array<uint8_t, 2048> &log,
+                             std::array<uint8_t, 1536> *raw_phys);
+  bool read_efuse_8852be(std::array<uint8_t, 2048> &log,
+                         std::array<uint8_t, 1536> *raw_phys);
 
   bool usb_pre_init();
   void usb_init(); /* runtime USB init (endpoint NUMP/burst) — usb_init_8852b */
@@ -534,7 +554,7 @@ public:
   void ptcl_init();
   void cmac_dma_init();
   void usb_rx_agg_cfg();
-  void coex_mac_init();                    /* LTE/BT coex bring-up */
+  bool coex_mac_init();                    /* LTE/BT coex bring-up */
   bool write_lte(uint32_t offset, uint32_t val); /* LTE-coex indirect write */
   void mac_enable_imr(); /* DMAC+CMAC0 error-interrupt masks (SER) + err-IMR */
   /* Physical efuse read loop (read_hw_efuse, DDV bank) into `phys`. */
@@ -644,6 +664,19 @@ public:
     _cca_default_unmeasured = default_unmeasured;
   }
   void set_kfr_ofld(bool on) { _kfr_ofld = on; }
+  void set_hardware_pta(bool on) { _hardware_pta = on; }
+private:
+  bool _hardware_pta = false;
+  orchard::rtl8852be::PtaSession _pta;
+  bool _be_pcie_prepared = false;
+  /* The RTL8852BE's power-on settings from its efuse (cut is read at each
+   * power-on); defaults until read_efuse has run. */
+  orchard::rtl8852be::PowerConfig _be_power{};
+  bool _be_efuse_read = false;
+public:
+  bool coexistence_tx_allowed() const { return !_hardware_pta || _pta.transmit_allowed(); }
+  bool shutdown_coexistence();
+  void fail_coexistence();
 };
 
 } /* namespace kestrel */

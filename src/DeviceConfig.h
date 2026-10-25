@@ -386,6 +386,8 @@ struct DeviceConfig {
      * hop returns before the synth settles — the caller honours a ~1.5 ms
      * settle before TX (the demos' admission window). 8852B only. */
     int kestrel_fastretune_ofld = 1;
+    // Experimental B MAC/PTA only; firmware BTC/RFK bridge is not ported.
+    bool kestrel_hardware_pta = false;
     /* env: DEVOURER_FW_TABLE_OFLD — Jaguar2 init-time firmware register
      * IO-offload (HalMAC cfg_param): route the static BB/AGC/RF phy-table write
      * stream through one FW_OFFLOAD/CFG_PARAM H2C per ~160-command batch that

@@ -355,9 +355,9 @@ std::unique_ptr<IRadio> WiFiDriver::CreateRadioPcie(
   if (auto kvariant = kestrel::variant_for_pci_id(transport->pci_vendor_id(),
                                                   transport->pci_device_id())) {
     if (*kvariant != kestrel::ChipVariant::C8852C) {
-      _logger->error("PCI {:04x}:{:04x} at {} is an RTL8852BE: its PCIe power "
-                     "sequence is unported — refusing rather than running the "
-                     "USB one",
+      _logger->error("PCI {:04x}:{:04x} at {} is an RTL8852BE: only its "
+                     "power-on and firmware download are ported, not the "
+                     "live bring-up — refusing",
                      transport->pci_vendor_id(), transport->pci_device_id(),
                      transport->bdf());
       return nullptr;

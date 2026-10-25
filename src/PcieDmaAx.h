@@ -68,7 +68,7 @@ public:
   PcieDmaAx(PcieTransport &t, Logger_t logger, int rx_poll_us,
             bool quick_submit = false);
 
-  const char *name() const override { return "ax-haxi"; }
+  const char *name() const override { return _be ? "ax-8852be" : "ax-haxi"; }
   size_t slab_bytes() const override;
   unsigned dma_address_bits() const override;
   size_t low_slab_bytes() const override;
@@ -126,6 +126,7 @@ private:
   PcieTransport &_t;
   Logger_t _logger;
   int _rx_poll_us;
+  bool _be;
   bool _quick_submit; /* PcieTransport::Config::tx_quick_submit */
   std::atomic<bool> _kick_deferred{false};
 

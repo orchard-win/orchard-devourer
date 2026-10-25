@@ -73,6 +73,9 @@ RtlKestrelDevice::RtlKestrelDevice(RtlAdapter device, Logger_t logger,
   /* FastRetune firmware IO-offload (8852B same-sub-band hop). Armed here so it
    * covers every bring-up path; a no-op on the 8852C / relock path. */
   _hal.set_kfr_ofld(_cfg.tuning.kestrel_fastretune_ofld != 0);
+  if (_cfg.tuning.kestrel_hardware_pta && variant != kestrel::ChipVariant::C8852B)
+    throw std::invalid_argument("hardware-pta is an experimental RTL8852B policy");
+  _hal.set_hardware_pta(_cfg.tuning.kestrel_hardware_pta);
   /* DEVOURER_TX_PWR on Kestrel = the fixed BB TX power in whole dBm (distinct
    * from the Jaguar2 TXAGC-index meaning). Applied at every set_channel. */
   if (_cfg.tx.power_index.has_value())
@@ -97,6 +100,7 @@ RtlKestrelDevice::~RtlKestrelDevice() {
   _device.quiesce_tx();
   _rx_stop = true;
   stop_wp_drain();
+  _hal.shutdown_coexistence();
   pcie_quiesce();
 }
 
@@ -112,8 +116,8 @@ void RtlKestrelDevice::pcie_quiesce() {
   if (_rx_running.load())
     _logger->warn("Kestrel PCIe: RX loop still running after 2 s — stopping "
                   "DMA under it");
-  _pcie_quiesced = true;
-  _hal.pcie_deinit();
+  _pcie_quiesced = _hal.pcie_deinit();
+  if (!_pcie_quiesced) _logger->error("Kestrel PCIe: DMA quiescence not confirmed");
 }
 
 void RtlKestrelDevice::start_wp_drain() {
@@ -175,7 +179,7 @@ bool RtlKestrelDevice::PowerOnFwAndTrx(kestrel::EfuseInfo &out) {
     return false;
   if (!_hal.trx_cmac_rx_init())
     return false;
-  _hal.intf_init();
+  if (!_hal.intf_init()) return false;
   _hal.fw_err_state("post-mac-hal-init");
   return _hal.read_efuse(out);
 }
@@ -188,6 +192,11 @@ bool RtlKestrelDevice::PowerOnTrxAndPhy(kestrel::EfuseInfo &out) {
 
 
 bool RtlKestrelDevice::BringUpMonitor(SelectedChannel channel) {
+  struct CoexFailureGuard {
+    kestrel::HalKestrel& hal;
+    bool complete = false;
+    ~CoexFailureGuard() { if (!complete) hal.fail_coexistence(); }
+  } guard{_hal};
   _channel = channel;
   /* hal_start_8852b order (rtl8852b_halinit.c:508): mac_hal_init [pwr ->
    * FWDL -> enable_bb_rf -> sys_init -> trx_init -> intf_init] -> efuse ->
@@ -209,6 +218,7 @@ bool RtlKestrelDevice::BringUpMonitor(SelectedChannel channel) {
   if (!_hal.set_channel(channel.Channel, channel.ChannelWidth, channel.ChannelOffset, channel.Band))
     return false;
   _brought_up = true;
+  guard.complete = true;
   return true;
 }
 
@@ -455,8 +465,13 @@ void RtlKestrelDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
 }
 
 void RtlKestrelDevice::SetMonitorChannel(SelectedChannel channel) {
+  const bool ok = _hal.set_channel(channel.Channel, channel.ChannelWidth,
+                                    channel.ChannelOffset, channel.Band);
+  if (!ok && _cfg.tuning.kestrel_hardware_pta) {
+    _hal.fail_coexistence();
+    throw std::runtime_error("Kestrel: channel/PTA update failed; stop the experimental session");
+  }
   _channel = channel;
-  _hal.set_channel(channel.Channel, channel.ChannelWidth, channel.ChannelOffset, channel.Band);
 }
 
 void RtlKestrelDevice::SetCcaMode(bool disabled) {
@@ -1060,6 +1075,7 @@ devourer::AdapterCaps RtlKestrelDevice::GetAdapterCaps() {
 }
 
 bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
+  if (!_hal.coexistence_tx_allowed()) return false;
   if (!_tx_up) {
     _logger->error("Kestrel: send_packet before InitWrite (TX not up)");
     return false;
