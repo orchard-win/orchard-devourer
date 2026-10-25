@@ -74,6 +74,7 @@ public:
   size_t low_slab_bytes() const override;
   bool attach(const DmaSlab &slab) override;
   std::vector<DmaQuiesceOp> quiesce_ops() const override;
+  DmaIdlePoll idle_poll() const override;
   void setup_rings() override;
   int tx_submit(uint8_t hint, uint8_t *buf, size_t len,
                 int timeout_ms) override;

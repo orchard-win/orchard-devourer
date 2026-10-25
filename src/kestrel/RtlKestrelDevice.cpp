@@ -113,10 +113,16 @@ void RtlKestrelDevice::pcie_quiesce() {
   _rx_stop = true;
   for (int i = 0; i < 200 && _rx_running.load(); i++)
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  if (_rx_running.load())
+  const bool rx_running = _rx_running.load();
+  if (rx_running)
     _logger->warn("Kestrel PCIe: RX loop still running after 2 s — stopping "
                   "DMA under it");
-  _pcie_quiesced = _hal.pcie_deinit();
+  /* The 8852BE drains its ring when the reap loop has let go of it, and
+   * powers off after the stop as rtw89 does. */
+  if (_variant == kestrel::ChipVariant::C8852B)
+    _pcie_quiesced = _hal.shutdown_be(!rx_running).stopped;
+  else
+    _pcie_quiesced = _hal.pcie_deinit();
   if (!_pcie_quiesced) _logger->error("Kestrel PCIe: DMA quiescence not confirmed");
 }
 

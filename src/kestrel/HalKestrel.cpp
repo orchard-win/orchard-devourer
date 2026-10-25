@@ -397,10 +397,16 @@ bool HalKestrel::pcie_pre_init() {
    * dmac_pre_init (HAXI DMA_MODE=PCIE_1B, HCI enables) and before FWDL. */
   if (_variant == ChipVariant::C8852B) {
     orchard::rtl8852be::KestrelPcie io(_device);
+    _device.set_dma_state(devourer::DmaState::running);
     const auto status = orchard::rtl8852be::PcieControl(io).prepare();
     _be_pcie_prepared = static_cast<bool>(status);
-    if (!status) _logger->error("BE PCIe prepare failed: error={} reg=0x{:04x} cleanup_failed={}",
-        static_cast<int>(status.error), status.address, status.cleanup_failed);
+    if (!status) {
+      /* A failed prepare runs the stop again; its idle poll is the cleanup. */
+      _device.set_dma_state(status.cleanup_failed ? devourer::DmaState::unconfirmed
+                                                  : devourer::DmaState::stopped);
+      _logger->error("BE PCIe prepare failed: error={} reg=0x{:04x} cleanup_failed={}",
+          static_cast<int>(status.error), status.address, status.cleanup_failed);
+    }
     return _be_pcie_prepared;
   }
   /* Before anything can arm it: a chip the host forbids LTR must never send
@@ -455,6 +461,8 @@ bool HalKestrel::pcie_init() {
     const auto status = orchard::rtl8852be::PcieControl(io).start(_device.ltr_allowed());
     if (!status) {
       _be_pcie_prepared = false;
+      _device.set_dma_state(status.cleanup_failed ? devourer::DmaState::unconfirmed
+                                                  : devourer::DmaState::stopped);
       _logger->error("BE PCIe start failed: error={} reg=0x{:04x} cleanup_failed={}",
           static_cast<int>(status.error), status.address, status.cleanup_failed);
     }
@@ -481,8 +489,10 @@ bool HalKestrel::pcie_deinit() {
     _be_pcie_prepared = false;
     orchard::rtl8852be::KestrelPcie io(_device);
     const auto status = orchard::rtl8852be::PcieControl(io).stop();
-    if (!status) _logger->error("BE PCIe stop failed: error={} reg=0x{:04x}; DMA release is not authorized",
-        static_cast<int>(status.error), status.address);
+    _device.set_dma_state(status ? devourer::DmaState::stopped : devourer::DmaState::unconfirmed);
+    if (!status) _logger->error("BE PCIe stop failed: error={} reg=0x{:04x} DMA_BUSY1=0x{:08x}; "
+        "DMA release is not authorized", static_cast<int>(status.error), status.address,
+        _device.rtw_read32(0x101c));
     return static_cast<bool>(status);
   }
   /* rtw89_pci_ops_deinit: LTR off, DMA stopped, indices cleared. The rtw89
@@ -596,6 +606,7 @@ bool HalKestrel::power_on_8852be() {
   be::KestrelPcie io(_device);
   be::PowerConfig config = _be_power;
   config.cut = read_cut();
+  _be_powered = true;
   auto status = be::power_on(io, config);
   if (!status) {
     _logger->warn("Kestrel: BE power-on failed (error={} reg=0x{:04x}); "
@@ -638,7 +649,28 @@ bool HalKestrel::power_off() {
   if (!status)
     _logger->error("Kestrel: BE power-off failed (error={} reg=0x{:04x})",
                    static_cast<int>(status.error), status.address);
+  else
+    _be_powered = false;
   return static_cast<bool>(status);
+}
+
+HalKestrel::BeShutdown HalKestrel::shutdown_be(bool drain_rx) {
+  BeShutdown result;
+  if (_device.is_usb() || _variant != ChipVariant::C8852B) {
+    _logger->error("Kestrel: shutdown_be is ported for the 8852BE only");
+    return result;
+  }
+  if (drain_rx && _be_pcie_prepared) {
+    /* Hand the RX and release-report buffers back before the stop. A full RX
+     * ring alone did not hold the stop on hardware (DMA_BUSY1 stayed 0); the
+     * one timeout seen, after TX, is unexplained, and 50 ms is cheap. */
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    _device.bulk_read_async_loop(0, 0, [](const uint8_t *, int) {},
+                                 [until] { return std::chrono::steady_clock::now() >= until; });
+  }
+  result.stopped = pcie_deinit();
+  result.powered_off = !_be_powered || power_off();
+  return result;
 }
 
 bool HalKestrel::power_on() {

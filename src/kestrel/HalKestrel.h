@@ -50,6 +50,16 @@ public:
   /* RTL8852BE (PCIe) only: rtw89_mac_pwr_off. Refused while pcie_pre_init's
    * DMA is up; pcie_deinit first, as rtw89 runs mac_pre_deinit. */
   bool power_off();
+  /* RTL8852BE (PCIe) only: the whole stop. With `drain_rx` and DMA up, the RX
+   * and release-report rings are emptied first; the caller must own them then
+   * (no reap loop running). Then
+   * pcie_deinit, then power_off when a power-on was attempted since the last
+   * power-off, whether or not the stop was confirmed. */
+  struct BeShutdown {
+    bool stopped = false;     /* DMA polled idle */
+    bool powered_off = false; /* or there was nothing to power off */
+  };
+  BeShutdown shutdown_be(bool drain_rx);
 
   /* Dump the physical WiFi efuse (register read loop) and parse it to the
    * logical map, filling `out`. Independent of firmware (driver path only).
@@ -669,6 +679,7 @@ private:
   bool _hardware_pta = false;
   orchard::rtl8852be::PtaSession _pta;
   bool _be_pcie_prepared = false;
+  bool _be_powered = false; /* power-on attempted, no power-off since */
   /* The RTL8852BE's power-on settings from its efuse (cut is read at each
    * power-on); defaults until read_efuse has run. */
   orchard::rtl8852be::PowerConfig _be_power{};

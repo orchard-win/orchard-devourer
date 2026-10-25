@@ -39,6 +39,14 @@ struct UsbLinkInfo {
   std::vector<uint8_t> bulk_out_eps; /* descriptor order */
 };
 
+/* What a HAL last established about a PCIe DMA engine (set_dma_state). */
+enum class DmaState {
+  unknown,     /* never reported: this HAL did not start DMA */
+  running,     /* started, or being started; no stop confirmed since */
+  stopped,     /* polled idle after a stop */
+  unconfirmed, /* a stop ran and idle was not seen */
+};
+
 class ITransport {
 public:
   virtual ~ITransport() = default;
@@ -141,6 +149,10 @@ public:
    * whose LTR engine is armed by the driver (the AX parts) must stay silent
    * when this is false. True on USB, which has no LTR. */
   virtual bool ltr_allowed() { return true; }
+  /* PCIe: the HAL's account of its DMA engine. A transport that owns the DMA
+   * memory hands it back only once the engine is known to be stopped. No-op
+   * on USB. */
+  virtual void set_dma_state(DmaState) {}
   virtual UsbLinkInfo usb_info() const { return {}; }
   virtual TxStats tx_stats() const { return {}; }
 };

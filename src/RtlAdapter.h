@@ -90,6 +90,8 @@ public:
   void hci_setup() { _transport->hci_setup(); }
   /* PCIe LTR permission (ITransport::ltr_allowed); true on USB. */
   bool ltr_allowed() { return _transport->ltr_allowed(); }
+  /* PCIe DMA engine state for the transport (ITransport::set_dma_state). */
+  void set_dma_state(devourer::DmaState state) { _transport->set_dma_state(state); }
   /* Pipelined register writes — see ITransport::write_batch_begin. */
   void write_batch_begin() { _transport->write_batch_begin(); }
   bool write_batch_end() { return _transport->write_batch_end(); }

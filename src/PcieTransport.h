@@ -152,6 +152,9 @@ public:
    * the PCIe capability is missing or unreadable — silence is the safe
    * side. */
   bool ltr_allowed() override;
+  /* Read by the host backend's teardown: the Windows one keeps the slab
+   * rather than free it under a DMA engine not known to be stopped. */
+  void set_dma_state(DmaState state) override { _dma_state = state; }
   TxStats tx_stats() const override;
 
   size_t mmio_len() const { return _mmio_len; }
@@ -259,6 +262,7 @@ private:
   std::atomic<uint64_t> _tx_failed{0};
   std::atomic<int> _tx_last_rc{0};
   std::atomic<bool> _warned_oob{false};
+  std::atomic<DmaState> _dma_state{DmaState::unknown};
 
   std::unique_ptr<IPcieDmaPlane> _dma;
 };

@@ -51,6 +51,13 @@ struct DmaQuiesceOp {
   bool set; /* false = clear */
 };
 
+/* The register whose `busy` bits stay set while a plane's DMA still runs
+ * after its quiesce ops. busy == 0: the plane cannot tell. */
+struct DmaIdlePoll {
+  uint32_t reg = 0;
+  uint32_t busy = 0;
+};
+
 class IPcieDmaPlane {
 public:
   virtual ~IPcieDmaPlane() = default;
@@ -73,6 +80,8 @@ public:
 
   /* 32-bit register operations that stop this plane's DMA, in order. */
   virtual std::vector<DmaQuiesceOp> quiesce_ops() const { return {}; }
+  /* Where to see that those ops took hold. */
+  virtual DmaIdlePoll idle_poll() const { return {}; }
 
   /* Program the ring base/num/index registers and reset the host indices
    * (rtw88 rtw_pci_reset_buf_desc / rtw89 rtw89_pci_reset_trx_rings). Where

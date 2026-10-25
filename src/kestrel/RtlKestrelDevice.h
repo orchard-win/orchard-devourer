@@ -285,7 +285,9 @@ private:
   /* PCIe: stop the HAXI DMA engine + clear the ring indices (HalKestrel::
    * pcie_deinit) exactly once, from Stop() or the destructor, whichever comes
    * first — an RX-only session has the RXQ DMA live too, and the transport
-   * unmaps the slab right after the device goes away. No-op on USB. */
+   * unmaps the slab right after the device goes away, once the HAL has
+   * reported the stop confirmed (8852BE: HalKestrel::shutdown_be, which also
+   * powers off). No-op on USB. */
   void pcie_quiesce();
   bool _pcie_quiesced = false;
   /* True while StartRxLoop's reap loop runs; pcie_quiesce waits for it to

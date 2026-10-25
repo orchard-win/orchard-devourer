@@ -93,6 +93,26 @@ void free_blocks(std::vector<ULONG_PTR> &frames) {
   frames.clear();
 }
 
+/* Reads `idle.reg` through the proxy until none of its busy bits is set.
+ * False on a timeout or a register that does not answer. */
+bool wait_idle(HANDLE proxy, const DmaIdlePoll &idle) {
+  for (int attempt = 0; attempt < 100; attempt++) {
+    REGPROXY_OP op{};
+    op.offset = idle.reg;
+    op.width = 4;
+    op.kind = REGPROXY_READ;
+    DWORD returned = 0;
+    if (!DeviceIoControl(proxy, IOCTL_REGPROXY_BATCH, &op, sizeof(op), &op,
+                         sizeof(op), &returned, nullptr) ||
+        op.value == 0xFFFFFFFFu)
+      return false;
+    if (!(op.value & idle.busy))
+      return true;
+    Sleep(1);
+  }
+  return false;
+}
+
 /* "PCI\VEN_10EC&DEV_C852&..." -> the hex field after `key`. */
 uint16_t instance_id_field(const wchar_t *instance_id, const wchar_t *key) {
   const wchar_t *at = std::wcsstr(instance_id, key);
@@ -109,6 +129,7 @@ struct PcieTransport::Os {
   std::vector<ULONG_PTR> head;      /* frames of single pages mapped first */
   std::vector<ULONG_PTR> blocks;    /* first frame of each block mapped next */
   std::vector<REGPROXY_OP> quiesce; /* stops the plane's DMA engine */
+  DmaIdlePoll idle;                 /* shows that it has stopped */
   std::atomic<bool> io_error_logged{false};
 };
 
@@ -117,7 +138,13 @@ PcieTransport::PcieTransport(Logger_t logger, Config cfg)
 
 PcieTransport::~PcieTransport() {
   _dma.reset();
-  if (_os->proxy != INVALID_HANDLE_VALUE && !_os->quiesce.empty()) {
+  /* Freed under a live engine, the slab's pages go to whoever asks next while
+   * the card can still write them: they go back only once DMA is known to be
+   * stopped. */
+  const bool armed = _os->proxy != INVALID_HANDLE_VALUE && !_os->quiesce.empty();
+  const DmaState state = _dma_state;
+  bool release = true;
+  if (armed && state != DmaState::stopped) {
     /* The device object stops DMA on its own teardown; repeating it here is
      * what makes freeing the slab safe when that object never existed. */
     DWORD returned = 0;
@@ -125,17 +152,40 @@ PcieTransport::~PcieTransport() {
         static_cast<DWORD>(_os->quiesce.size() * sizeof(REGPROXY_OP));
     DeviceIoControl(_os->proxy, IOCTL_REGPROXY_BATCH, _os->quiesce.data(),
                     bytes, _os->quiesce.data(), bytes, &returned, nullptr);
+    /* A stop the HAL saw fail stays failed; one it started and never stopped
+     * is polled where the plane can tell. */
+    if (state == DmaState::unconfirmed)
+      release = false;
+    else if (state == DmaState::running && _os->idle.busy)
+      release = wait_idle(_os->proxy, _os->idle);
+  }
+  if (armed && release) {
+    DWORD returned = 0;
     DeviceIoControl(_os->proxy, IOCTL_REGPROXY_SET_CLOSE_OPS, nullptr, 0,
                     nullptr, 0, &returned, nullptr);
+    _logger->info("PcieTransport: DMA slab released ({})",
+                  state == DmaState::stopped ? "the HAL confirmed the stop"
+                  : state == DmaState::unknown
+                      ? "the HAL reported no DMA"
+                  : _os->idle.busy ? "idle after the stop replayed here"
+                                   : "the plane cannot show idle");
   }
-  if (_os->slab) {
-    MapUserPhysicalPages(_os->slab,
-                         _os->head.size() + _os->blocks.size() * kPagesPerBlock,
-                         nullptr);
-    VirtualFree(_os->slab, 0, MEM_RELEASE);
+  if (!release) {
+    /* The driver replays the stop once more when the handle closes below; the
+     * pages stay locked to this process until it exits. */
+    _logger->error("PcieTransport: DMA was not confirmed stopped — keeping "
+                   "the {} MiB DMA slab locked until the process exits",
+                   _slab.len >> 20);
+  } else {
+    if (_os->slab) {
+      MapUserPhysicalPages(
+          _os->slab, _os->head.size() + _os->blocks.size() * kPagesPerBlock,
+          nullptr);
+      VirtualFree(_os->slab, 0, MEM_RELEASE);
+    }
+    free_blocks(_os->head);
+    free_blocks(_os->blocks);
   }
-  free_blocks(_os->head);
-  free_blocks(_os->blocks);
   if (_os->proxy != INVALID_HANDLE_VALUE)
     CloseHandle(_os->proxy);
 }
@@ -371,6 +421,7 @@ bool PcieTransport::init_dma() {
     op.kind = q.set ? REGPROXY_SET_BITS : REGPROXY_CLEAR_BITS;
     _os->quiesce.push_back(op);
   }
+  _os->idle = _dma->idle_poll();
   DWORD returned = 0;
   if (_os->quiesce.empty() ||
       !DeviceIoControl(

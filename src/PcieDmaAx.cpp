@@ -174,6 +174,12 @@ std::vector<DmaQuiesceOp> PcieDmaAx::quiesce_ops() const {
   };
 }
 
+DmaIdlePoll PcieDmaAx::idle_poll() const {
+  /* DMA_BUSY1: what PcieControl::stop polls, the RXQ/RPQ and active TX bits. */
+  if (_be) return {0x101c, orchard::rtl8852be::active_stop_mask | 3u};
+  return {};
+}
+
 bool PcieDmaAx::attach(const DmaSlab &dma) {
   const Layout l = layout();
   if (dma.len < l.total ||
