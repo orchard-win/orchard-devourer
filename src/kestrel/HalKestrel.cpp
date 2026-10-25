@@ -2006,8 +2006,11 @@ bool HalKestrel::coex_mac_init() {
   if (_hardware_pta) {
     orchard::rtl8852be::KestrelPta io(_device);
     const bool ok = _pta.initialize(io);
-    if (!ok) _logger->error("Kestrel: experimental hardware-PTA init failed (cleanup_pending={})",
-                            _pta.cleanup_pending());
+    if (ok)
+      _logger->info("Kestrel: experimental hardware PTA active; the Bluetooth grant follows the arbiter");
+    else
+      _logger->error("Kestrel: experimental hardware-PTA init failed (cleanup_pending={})",
+                     _pta.cleanup_pending());
     return ok;
   }
   /* mac_coex_init_8852b prologue (coex_8852b.c:154): B_AX_ENBT arms the BT/

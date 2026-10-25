@@ -69,6 +69,10 @@ public:
   void Stop() override {
     _rx_stop = true;
     stop_wp_drain();
+    /* As in the destructor: the PTA goes back to the Bluetooth while the MAC
+     * still answers. The 8852BE's stop powers it off, and on the TX20E a
+     * release after that failed. */
+    _hal.shutdown_coexistence();
     pcie_quiesce();
   }
   void SetMonitorChannel(SelectedChannel channel) override;
