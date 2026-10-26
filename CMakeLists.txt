@@ -530,6 +530,22 @@ if(DEVOURER_KESTREL)
         src/kestrel/KestrelLe.h
         src/kestrel/RtlKestrelDevice.cpp src/kestrel/RtlKestrelDevice.h)
     target_compile_definitions(devourer PUBLIC DEVOURER_HAVE_KESTREL=1)
+
+    # The RTL8852BE over PCIe (Orchard's port, from Linux rtw89): its power
+    # sequence, efuse map, PCIe control and ring contract need no devourer, so
+    # they are their own library for the headless guards below. The register
+    # adapters (kestrel_pcie.h, kestrel_pta.h) sit on RtlAdapter and stay in
+    # devourer. HalKestrel includes both halves whichever die is built.
+    add_library(devourer_rtl8852be STATIC
+        src/kestrel/rtl8852be/rtl8852be.cpp src/kestrel/rtl8852be/rtl8852be.h
+        src/kestrel/rtl8852be/power.cpp src/kestrel/rtl8852be/power.h
+        src/kestrel/rtl8852be/pcie_control.cpp src/kestrel/rtl8852be/pcie_control.h)
+    target_include_directories(devourer_rtl8852be PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/kestrel/rtl8852be)
+    target_compile_features(devourer_rtl8852be PUBLIC cxx_std_20)
+    target_sources(devourer PRIVATE
+        src/kestrel/rtl8852be/kestrel_pcie.h src/kestrel/rtl8852be/kestrel_pta.h)
+    target_link_libraries(devourer PUBLIC devourer_rtl8852be)
 endif()
 
 if(DEVOURER_KESTREL_8852B)
@@ -1386,6 +1402,35 @@ if(DEVOURER_KESTREL)
     target_include_directories(KestrelSchedSelftest PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME kestrel_sched COMMAND KestrelSchedSelftest)
+
+    # Headless guards for the RTL8852BE port (src/kestrel/rtl8852be/): the
+    # rtw89 ring and descriptor contract, and the PCIe control and power/efuse
+    # sequences against a fake register file. Register selection, not hardware.
+    add_executable(Rtl8852beSelftest tests/rtl8852be_selftest.cpp)
+    target_link_libraries(Rtl8852beSelftest PRIVATE devourer_rtl8852be)
+    add_test(NAME rtl8852be COMMAND Rtl8852beSelftest)
+
+    add_executable(Rtl8852bePcieSelftest tests/rtl8852be_pcie_selftest.cpp)
+    target_link_libraries(Rtl8852bePcieSelftest PRIVATE devourer_rtl8852be)
+    add_test(NAME rtl8852be_pcie COMMAND Rtl8852bePcieSelftest)
+
+    add_executable(Rtl8852bePowerSelftest tests/rtl8852be_power_selftest.cpp)
+    target_link_libraries(Rtl8852bePowerSelftest PRIVATE devourer_rtl8852be)
+    add_test(NAME rtl8852be_power COMMAND Rtl8852bePowerSelftest)
+
+    # The HAL's 8852BE paths (bring-up, DMA stop, PTA) over a byte-addressed
+    # fake transport; needs the PCIe plane.
+    if(DEVOURER_PCIE AND DEVOURER_KESTREL_8852B)
+        add_executable(Rtl8852beHalSelftest tests/rtl8852be_hal_selftest.cpp)
+        target_link_libraries(Rtl8852beHalSelftest PRIVATE devourer)
+        target_include_directories(Rtl8852beHalSelftest PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_definitions(Rtl8852beHalSelftest PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        if(MSVC)
+            target_compile_options(Rtl8852beHalSelftest PRIVATE /utf-8)
+        endif()
+        add_test(NAME rtl8852be_hal COMMAND Rtl8852beHalSelftest)
+    endif()
 endif()
 
 add_executable(RadiotapTxFlagsSelftest tests/radiotap_txflags_selftest.cpp)

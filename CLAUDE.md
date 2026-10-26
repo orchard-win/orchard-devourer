@@ -93,7 +93,8 @@ payload bounce, CH12 fwcmd slots for FWDL/H2C, RXQ/RPQ rings with
 release-report page recycling — the rtw89 host contract, since the vendor
 USB drop ships no PCIe ring driver). `Open()` picks the plane from the PCI
 device id; the factory dispatches `c852` before reading the Jaguar chip-id,
-and refuses the RTL8852BE (`b852`, power sequence unported). USB and PCIe are
+and creates the RTL8852BE (`b852`) only when the caller sets
+`tuning.kestrel_be_pcie` (`src/kestrel/CLAUDE.md`). USB and PCIe are
 independent transports behind `devourer::ITransport` (`src/Transport.h`);
 the bus-neutral `RtlAdapter` forwards to whichever it was built with. The
 bus-specific bring-up steps gate on `is_usb()` or ride `hci_setup()` — the
@@ -116,7 +117,7 @@ tests/pcie_rx_smoke.py` (ambient beacons, either part) and
 `tests/pcie_8852ce_onair.sh` (the 8852CE cell matrix against a USB 8852C
 witness: usb→pcie, pcie→usb, pcie→pcie, exact per-direction hit counts).
 
-**PCIe on Windows** (`src/PcieTransportWin.cpp`, RTL8852CE only): there is no
+**PCIe on Windows** (`src/PcieTransportWin.cpp`, RTL8852CE and RTL8852BE): there is no
 vfio, so registers go through a user-mode register proxy driver bound to the
 card (the winawdl project's; its IOCTL contract is `regproxy_ioctl.h`, found
 through `DEVOURER_REGPROXY_INCLUDE_DIR`) and the DMA slab is locked 2 MiB

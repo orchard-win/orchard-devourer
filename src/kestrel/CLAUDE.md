@@ -303,7 +303,7 @@ does differently on PCIe hangs off `is_usb()`; nothing here is a second HAL:
   exit line prints the RXQ packet-type histogram (t0 frames, t1 PPDU status,
   t10 C2H) — a PCIe receiver with t1=0 has lost its physts, not its frames.
 - **Not ported**: MSI (the plane polls the ring indices, 200 µs), the 8852BE
-  (refused at the factory), the CAV-cut-only `l12_vmain`/`gen2_force_ib` rows
+  unless the caller opts in (next section), the CAV-cut-only `l12_vmain`/`gen2_force_ib` rows
   (the lab modules are cut 1), and interrupt mitigation.
 
 Validation record (lab box, two RTL8852CE on one J6412: 05:00.0 on a root
@@ -326,6 +326,28 @@ card 09:00.0 99 % and 97 % — a spread the probe-repeatability rule in the
 root CLAUDE.md says to measure before reading as a difference between the
 cards. One lab, near field, no SDR: delivery figures for this pair, not a
 link-budget claim.
+
+## RTL8852BE over PCIe (Orchard's port)
+
+The 8852BE (`10ec:b852`) is this HAL over the same plane with its bus-dependent
+parts taken from Linux rtw89 at `734bef5`, under `rtl8852be/`:
+
+- `rtl8852be.{h,cpp}` — the BE's ring table, WD page and DMA address width
+  (`PcieDmaAx` switches on them as `ax-8852be`).
+- `power.{h,cpp}` — `rtw89_mac_pwr_on/off` for the 8852B and its 1216-byte
+  efuse map; `HalKestrel::power_on_8852be` keeps the efuse's settings once
+  `read_efuse` has run.
+- `pcie_control.{h,cpp}` — pre-init, start and stop of the BE's PCIe block.
+- `kestrel_pcie.h`, `kestrel_pta.h` — those sequences' register access over
+  `RtlAdapter`, and the experimental hardware PTA (`tuning.kestrel_hardware_pta`,
+  8852B only; firmware Bluetooth coexistence is not ported).
+
+The factory creates the BE only with `tuning.kestrel_be_pcie` set, and refuses
+it otherwise. `HalKestrel::shutdown_be` gathers its stop (drain, stop, power
+off), and the Windows transport frees the DMA slab only on a stop the HAL
+confirmed. Headless guards: `rtl8852be`, `rtl8852be_pcie`, `rtl8852be_power`
+and, with `DEVOURER_PCIE`, `rtl8852be_hal`. One card (a TP-Link Archer TX20E)
+on one Windows machine is the whole hardware record; Linux vfio has not run it.
 
 ## Station identity and hardware ACK (8852C over PCIe)
 
