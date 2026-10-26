@@ -4,7 +4,10 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <thread>
 
 #include "TxMode.h"
@@ -67,6 +70,7 @@ public:
    * demo shutdown). The destructor joins too, but the demos destroy the
    * device object after libusb_exit, so Stop() is the ordered join point. */
   void Stop() override {
+    _ack_disarm_thread = {}; /* cancel + join a pending test disarm */
     _rx_stop = true;
     stop_wp_drain();
     /* As in the destructor: the PTA goes back to the Bluetooth while the MAC
@@ -87,6 +91,37 @@ public:
    * IRtlRadio contract; SetCcaMode(d) == SetCcaGates(d, d). */
   bool SetCcaGates(bool primary_disabled, bool edcca_disabled) override;
   bool GetCcaGates(bool &primary_disabled, bool &edcca_disabled) override;
+  /* Hardware ACK responder (IRadio contract). The AX MAC has no Jaguar-style
+   * port identity register to retarget: the RMAC answers for an address only
+   * once the firmware has COMMITTED a valid ADDR_CAM entry for it, and it does
+   * that only for a station registered the way a real association registers
+   * one (HalKestrel::register_infra_sta). The arm programs that station with
+   * `mac` as its own address, on its own macid / ADDR_CAM entry (ack_slot())
+   * so the injection context at macid 0 / entry 0 (what every injected frame's
+   * WD points at) is left as bring-up programmed it, and RegisterPeerSta /
+   * RegisterBeamformee refuse that slot so a peer cannot take it; clears the
+   * response-abort CCA gates; and is verified by reading the physical CAM
+   * entry back -- false when the entry did not commit. The 8852C firmware
+   * ignores the addr_cam H2C, so on that die the host writes the same entry
+   * itself (HalKestrel::write_addr_cam_sta, the vendor's no-firmware path) and
+   * no H2C is sent. Post-bring-up only. Clear disconnects that station (8852B
+   * only) and clears the entry's VALID bit from the host (the 8852B firmware
+   * leaves a disconnected station's entry valid), and succeeds only once the
+   * entry has read back empty for 50 ms; an address still held after a failed
+   * clear (or a failed retarget, which checks the old address too) stays
+   * recorded, so a later ClearAckResponder retries it. Arm and clear are
+   * serialized. On the 8852C the response also depends on the bring-up
+   * taking the TX path selection from the BB's P-MAC registers
+   * (kestrel_halbb_ctrl_tx_path); without it some bring-ups armed and
+   * answered no ACK (docs/kestrel-ack-responder.md). */
+  bool SetAckResponder(const devourer::MacAddr &mac) override;
+  void ClearAckResponder() override;
+  /* rxdemo's live-disarm measurement hook (DEVOURER_ACK_DISARM_AFTER_MS): the
+   * delay starts once Init has finished the bring-up, including a configured
+   * SetAckResponder, never from process start. */
+  void ScheduleAckResponderDisarmForTest(uint32_t delay_ms) {
+    _ack_disarm_after_ms = delay_ms;
+  }
   bool send_packet(const uint8_t *packet, size_t length) override;
   devourer::TxStats GetTxStats() override { return _device.GetTxStats(); }
   SelectedChannel GetSelectedChannel() override { return _channel; }
@@ -213,7 +248,8 @@ public:
 
   /* Register an associated peer STA (macid/addr-cam) so a Trigger's per-user
    * grant scores against it — the AP-side companion to SendTrigger for the
-   * end-to-end UL path. */
+   * end-to-end UL path. Refuses the ACK responder's slot (ack_slot()) and an
+   * `addr_cam_idx` past the 128-entry CAM, as does RegisterBeamformee. */
   bool RegisterPeerSta(const uint8_t peer_mac[6], uint8_t macid,
                        uint8_t addr_cam_idx) override;
 
@@ -268,6 +304,20 @@ public:
   void EnableTxScheduler();
 
 private:
+  /* One pass of BringUpMonitor, no firmware-halt check. */
+  bool BringUpMonitorOnce(SelectedChannel channel);
+  /* The TX half of InitWrite, run after BringUpMonitorOnce. */
+  void InitWriteTail(SelectedChannel channel);
+  /* Run `once` (a full bring-up from power_on), then read HALT_C2H_CTRL. A
+   * bring-up can end with the firmware halted (L1 pre-error 0x999, then an
+   * assertion) while every step reported success; the radio then works for a
+   * while and its TX queues stop draining for good. Redo the bring-up, up to
+   * kFwHaltAttempts in all on USB (PCIe: no redo). False, with the bulk-IN
+   * drain stopped, when `once` fails or every attempt halts. */
+  bool BringUpCheckingFwHalt(const char *what,
+                             const std::function<bool()> &once);
+  static constexpr int kFwHaltAttempts = 3;
+
   /* Route a C2H firmware message (RPKT_TYPE_C2H payload). Currently decodes the
    * USR_TX_RPT_INFO report and emits its freerun TX-egress timestamp. */
   void handle_c2h(const uint8_t *payload, uint32_t len);
@@ -306,6 +356,43 @@ private:
    * ACH0 is channel 0, so "TX is up" is its own flag, not a non-zero handle. */
   bool _tx_up = false;
   bool _brought_up = false; /* Init/InitWrite completed the MAC bring-up */
+  /* Armed ACK responder address, and the R_AX_TRXPTCL_RESP_0 value the arm
+   * replaced (restored by ClearAckResponder). */
+  std::optional<devourer::MacAddr> _ack_responder;
+  uint32_t _ack_resp0_saved = 0;
+  /* Serializes SetAckResponder/ClearAckResponder: the test disarm below
+   * calls ClearAckResponder from its own thread. */
+  std::mutex _ack_mutex;
+  /* Rewrite macid 0 to the NO_LINK entry, restore RESP_0 and poll the CAM
+   * until it holds none of `held`. Returns the address still held on
+   * timeout, nullopt once gone. Caller holds _ack_mutex. */
+  std::optional<devourer::MacAddr>
+  disarm_ack_locked(std::span<const devourer::MacAddr> held);
+  /* The ACK responder's own macid and ADDR_CAM entry (the same number), past
+   * the injection context at macid 0 / entry 0 and the low slots peer
+   * registrations take by convention (RegisterPeerSta callers use 1, 2, ...).
+   * 127 on the 8852B, where the firmware commits and the RMAC answers there
+   * (measured); 63 on the 8852C, where the host writes it and the RMAC
+   * answers there (measured). Both dies have 128 entries. */
+  uint8_t ack_slot() const {
+    return _variant == kestrel::ChipVariant::C8852C ? 63 : 127;
+  }
+  /* Address-CAM entries (vendor ADDRCAM_NUM): 128 on both dies. */
+  static constexpr unsigned kAddrCamEntries = 128;
+  /* The 8852C firmware ignores the addr_cam H2C, so the ACK responder's
+   * station entry is written (and cleared) by the host on that die. */
+  bool host_written_ack_cam() const {
+    return _variant == kestrel::ChipVariant::C8852C;
+  }
+  /* True (and logged) when a peer registration would take the ACK
+   * responder's reserved macid or ADDR_CAM entry, or an ADDR_CAM entry past
+   * the CAM (kAddrCamEntries). */
+  bool peer_slot_reserved(const char *who, uint8_t macid,
+                          uint8_t addr_cam_idx) const;
+  std::optional<uint32_t> _ack_disarm_after_ms;
+  std::jthread _ack_disarm_thread;
+  /* DEVOURER_ACK_RESPONDER: arm at the end of bring-up, throw if refused. */
+  void arm_configured_ack_responder();
   uint8_t _tx_mgmt_q = 0;
   uint8_t _tx_data_q = 0;
   bool _tx_data_ok = false; /* data frames may use _tx_data_q */

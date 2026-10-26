@@ -3,9 +3,11 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 
 #include "ChipVariant.h"
 #include "KestrelFw.h"
+#include "KestrelAddrCam.h"
 #include "MacRegAx.h" /* mac_ax role enums */
 #include "RtlAdapter.h"
 #include "SelectedChannel.h" /* ChannelWidth_t */
@@ -180,6 +182,10 @@ public:
    * must ensure same band + same width (20 MHz). */
   void fast_retune(uint8_t channel);
 
+  /* 80 MHz, 5 GHz: move the primary 20 within the current 80 MHz block
+   * (BB primary index + 5 MHz mask + MAC TXSC + BB reset), no RF tune. */
+  void fast_set_primary_80(uint8_t channel, uint8_t center);
+
   /* Lean same-channel 20 <-> 5/10 MHz narrowband toggle: only the BB small-BW
    * field + ACI-detect change (the RF stays in 20 MHz mode for all of 20/5/10,
    * so no RF re-tune, no gain/channel re-apply). ~a BB write + reset vs the full
@@ -283,6 +289,143 @@ public:
                                /*bmc=*/false) &&
          ok;
     return ok;
+  }
+
+  /* Register `own` as an associated INFRA station of `bssid` -- what makes the
+   * firmware COMMIT the physical ADDR_CAM entry, which add_self_sta's NO_LINK
+   * entry never gets (accepted over H2C, reads back valid=0). Two commands, in
+   * the order the vendor Windows driver sends them on a real association
+   * (captured over USBPcap): join_info(INFRA, connect), THEN the station
+   * addr_cam (SMA=own, TMA=bssid, SHORT entry, BSSID CAM at index 1). The
+   * join is the step that matters: without it the entry never commits. The
+   * vendor's surrounding commands (role CLIENT, macid unpause, CMAC and DMAC
+   * tables) were each dropped on the 8852B with no change in the commit or the
+   * ACK rate, so they are not sent. The commit is asynchronous; callers verify
+   * with addr_cam_holds(). The 8852C firmware ignores the addr_cam H2C
+   * altogether (neither CAM entry is written), so that die takes
+   * write_addr_cam_sta() instead. */
+  bool register_infra_sta(const uint8_t own[6], const uint8_t bssid[6],
+                          uint8_t macid, uint8_t addr_cam_idx,
+                          uint8_t bssid_cam_idx, uint8_t band = 0,
+                          uint8_t port = 0) {
+    bool ok = _fw.fw_join_info(macid, reg::MAC_AX_NET_TYPE_INFRA,
+                               reg::MAC_AX_SELF_ROLE_CLIENT,
+                               reg::MAC_AX_WIFI_ROLE_STATION, port, band,
+                               /*connect=*/true);
+    ok = _fw.fw_upd_addr_cam_sta(macid, own, bssid, reg::MAC_AX_NET_TYPE_INFRA,
+                                 addr_cam_idx, bssid_cam_idx) &&
+         ok;
+    return ok;
+  }
+
+  /* Undo register_infra_sta in the firmware: join_info(disconnect), then a
+   * NO_LINK addr_cam for `macid`. On the 8852B this does NOT invalidate the
+   * physical entry (it stays VALID with the station's SMA), so callers also
+   * clear_addr_cam_entry() and verify with addr_cam_holds(). */
+  bool unregister_infra_sta(const uint8_t own[6], uint8_t macid,
+                            uint8_t addr_cam_idx, uint8_t bssid_cam_idx,
+                            uint8_t band = 0, uint8_t port = 0) {
+    bool ok = _fw.fw_join_info(macid, reg::MAC_AX_NET_TYPE_INFRA,
+                               reg::MAC_AX_SELF_ROLE_CLIENT,
+                               reg::MAC_AX_WIFI_ROLE_STATION, port, band,
+                               /*connect=*/false);
+    ok = _fw.fw_upd_addr_cam(macid, own, reg::MAC_AX_NET_TYPE_NO_LINK,
+                             addr_cam_idx, bssid_cam_idx) &&
+         ok;
+    return ok;
+  }
+
+  /* Internal address of address-CAM entry `idx`. The stride is per die, as
+   * the vendor's get_addr_cam_size + mac_upd_addr_cam lay it out (entry N at
+   * N * len): the LONG entry (0x40) on the 8852B, the SHORT one (0x20) on the
+   * 8852C, 128 entries on both (ADDRCAM_NUM). */
+  uint32_t addr_cam_entry_addr(uint8_t idx) const {
+    const uint32_t stride = _variant == ChipVariant::C8852C
+                                ? reg::ADDR_CAM_ENT_SHORT_SIZE
+                                : reg::ADDR_CAM_ENT_LONG_SIZE;
+    return reg::ADDR_CAM_MEM_BASE + idx * stride;
+  }
+
+  /* Write one dword of the MAC's internal table SRAM (the write half of
+   * read_mac_mem32). False when either register transfer failed. */
+  bool write_mac_mem32(uint32_t internal_addr, uint32_t value) {
+    return _device.rtw_write32(reg::R_AX_FILTER_MODEL_ADDR, internal_addr) &&
+           _device.rtw_write32_wide(reg::R_AX_INDIR_ACCESS_ENTRY, value);
+  }
+  /* Clear VALID on address-CAM entry `idx`. */
+  bool clear_addr_cam_entry(uint8_t idx) {
+    return write_mac_mem32(addr_cam_entry_addr(idx), 0u);
+  }
+
+  /* Write the station entry register_infra_sta asks the firmware for straight
+   * into the physical address CAM -- the vendor's no-firmware path
+   * (mac_upd_addr_cam's indirect SRAM write), for the 8852C, whose firmware
+   * ignores the addr_cam H2C. The same SHORT entry the 8852B firmware commits:
+   * VALID, net_type INFRA, the SMA/TMA hashes (XOR of the address bytes),
+   * `bssid_cam_idx`, SMA=own, TMA=bssid, `macid` plus the vendor's bit 14.
+   * Only the address CAM: the vendor path also writes the BSSID CAM entry,
+   * but host-writing it changed nothing measurable (the response rate, and
+   * the bring-ups that answer no ACKs, both stayed). Synchronous. False on
+   * the first failed transfer, VALID then not set again (a failure after the
+   * VALID-off write leaves the entry invalid, not half-written and live);
+   * callers verify with addr_cam_sta_holds(). */
+  bool write_addr_cam_sta(uint8_t idx, const uint8_t own[6],
+                          const uint8_t bssid[6], uint8_t macid,
+                          uint8_t bssid_cam_idx) {
+    const auto w = addr_cam_sta_entry(own, bssid, reg::MAC_AX_NET_TYPE_INFRA,
+                                      bssid_cam_idx, macid);
+    const uint32_t base = addr_cam_entry_addr(idx);
+    /* VALID off first (a retarget rewrites a live entry), then the body, then
+     * VALID last, so the RMAC never matches a half-written entry. */
+    if (!write_mac_mem32(base, 0u))
+      return false;
+    for (int i = 7; i >= 1; --i)
+      if (!write_mac_mem32(base + 4 * i, w[i]))
+        return false;
+    return write_mac_mem32(base, w[0]);
+  }
+
+  /* Whether the physical address-CAM entry `idx` reads back as exactly the
+   * station entry write_addr_cam_sta writes for these arguments -- the check
+   * for the host-written path, where nothing but the read says the whole
+   * entry landed (addr_cam_holds only checks VALID + SMA). Every dword but
+   * dword 5, which the 8852C does not back: it reads 0xdeadbeef whatever was
+   * written (measured; the other seven read back as written). */
+  bool addr_cam_sta_holds(uint8_t idx, const uint8_t own[6],
+                          const uint8_t bssid[6], uint8_t macid,
+                          uint8_t bssid_cam_idx) {
+    const auto w = addr_cam_sta_entry(own, bssid, reg::MAC_AX_NET_TYPE_INFRA,
+                                      bssid_cam_idx, macid);
+    const uint32_t base = addr_cam_entry_addr(idx);
+    for (int i = 0; i < 8; ++i)
+      if (i != 5 && read_mac_mem32(base + 4 * i) != w[i])
+        return false;
+    return true;
+  }
+
+  /* One dword of the MAC's internal table SRAM (rtw89 mac_mem_read): the
+   * internal address goes to R_AX_FILTER_MODEL_ADDR, the data comes back
+   * through the R_AX_INDIR_ACCESS_ENTRY window (0x40000, a 32-bit-address
+   * access). */
+  uint32_t read_mac_mem32(uint32_t internal_addr) {
+    _device.rtw_write32(reg::R_AX_FILTER_MODEL_ADDR, internal_addr);
+    return _device.rtw_read32_wide(reg::R_AX_INDIR_ACCESS_ENTRY);
+  }
+
+  /* Whether the PHYSICAL address-CAM entry `idx` is valid and carries `sma` --
+   * what the RMAC actually matches A1 against, as opposed to what an H2C asked
+   * the firmware to write. Layout (rtw89 cam.h): word0 bit0 = VALID, then
+   * SMA[0..3] in word2 and SMA[4..5] in the low half of word3. */
+  bool addr_cam_holds(uint8_t idx, const uint8_t sma[6]) {
+    const uint32_t base = addr_cam_entry_addr(idx);
+    if (!(read_mac_mem32(base) & 0x1u))
+      return false;
+    const uint32_t w2 = read_mac_mem32(base + 8);
+    const uint32_t w3 = read_mac_mem32(base + 12);
+    const uint8_t got[6] = {static_cast<uint8_t>(w2), static_cast<uint8_t>(w2 >> 8),
+                            static_cast<uint8_t>(w2 >> 16), static_cast<uint8_t>(w2 >> 24),
+                            static_cast<uint8_t>(w3), static_cast<uint8_t>(w3 >> 8)};
+    return std::memcmp(got, sma, 6) == 0;
   }
 
   /* Register an associated peer STA (an AP-mode client we schedule UL for):
@@ -446,9 +589,17 @@ public:
   }
 
   /* Firmware SER probe: returns the latched mac_ax_err_info code if the fw has
-   * posted a halt error (HALT_C2H_CTRL set), else 0. Logs a labeled line so the
-   * bring-up can pinpoint which init step crashes the running fw. */
+   * posted a halt error (HALT_C2H_CTRL set; HALT_C2H_CTRL itself when that
+   * code reads 0 or cannot be read), else 0. Logs a labeled line so the
+   * bring-up can pinpoint which init step crashes the running fw. Only the
+   * HALT_C2H_CTRL read can throw; the diagnostics after it never do. */
   uint32_t fw_err_state(const char *where);
+
+  /* Forget the host-side state one bring-up leaves behind (the vendored
+   * halbb/halrf contexts and their one-shot inits, the fast-retune caches, the
+   * H2C sequence), so the next power_on -> ... -> set_channel runs as it would
+   * on a freshly constructed device. power_on itself forces the MAC off. */
+  void reset_for_rebringup();
 
   /* Poll HALT_C2H for `ms` with no other bus traffic — detects an async fw
    * self-crash after boot (vs a write-triggered one). */
@@ -514,6 +665,8 @@ private:
   bool pcie_ltr_silence();
   /* BB/RF channel helpers (all over the wIndex=1 window). */
   void bb_rmw(uint32_t addr, uint32_t mask, uint32_t val); /* masked BB write */
+  /* R_AX_WMAC_RFMOD + R_AX_TX_SUB_CARRIER_VALUE for `bw` around `center`. */
+  void mac_set_bw_txsc(uint8_t channel, uint8_t center, ChannelWidth_t bw);
   uint32_t bb_read(uint32_t addr, uint32_t mask); /* masked+shifted BB read */
   uint32_t rf_read(uint8_t path, uint8_t rf_addr);         /* DDV RF read */
   void rf_write(uint8_t path, uint8_t rf_addr, uint32_t val); /* DDV RF write */

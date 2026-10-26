@@ -4,6 +4,8 @@
 #include <thread>
 #include <climits> /* INT_MIN = "no radiotap DBM_TX_POWER" sentinel */
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -94,6 +96,9 @@ RtlKestrelDevice::RtlKestrelDevice(RtlAdapter device, Logger_t logger,
 }
 
 RtlKestrelDevice::~RtlKestrelDevice() {
+  /* Cancel + join a pending test disarm before the transport is quiesced
+   * under it (Stop() does the same; a caller may skip Stop()). */
+  _ack_disarm_thread = {};
   /* Inert on this generation (its send path is synchronous), but the invariant
    * belongs to every device: nothing gets released while a transfer the
    * transport still owns is outstanding. */
@@ -223,7 +228,59 @@ bool RtlKestrelDevice::PowerOnTrxAndPhy(kestrel::EfuseInfo &out) {
 }
 
 
+bool RtlKestrelDevice::BringUpCheckingFwHalt(
+    const char *what, const std::function<bool()> &once) {
+  /* The redo is measured on USB only (the 8852CE ring re-init under it is
+   * not), so on PCIe a halt fails the bring-up instead. */
+  const int attempts = _device.is_usb() ? kFwHaltAttempts : 1;
+  for (int attempt = 1; attempt <= attempts; ++attempt) {
+    if (attempt > 1)
+      _hal.reset_for_rebringup();
+    /* A failed or throwing pass (or halt probe) stops the drain
+     * BringUpMonitorOnce started. */
+    bool up = false;
+    uint32_t err = 0;
+    try {
+      up = once();
+      if (up)
+        err = _hal.fw_err_state(what);
+    } catch (...) {
+      stop_wp_drain();
+      throw;
+    }
+    if (!up) {
+      stop_wp_drain();
+      return false;
+    }
+    if (err == 0) {
+      if (attempt > 1)
+        _logger->info("Kestrel: {} clean on attempt {}", what, attempt);
+      return true;
+    }
+    /* Seen on the 8852C (TX50UH) without the early bulk-IN drain:
+     * DMAC_ERR_ISR B_AX_HAXIDMA_ERR_FLAG during the BB/RF table load, err
+     * 0x999 (L1_PREERR_DMAC), then a fw assert (0x3xxxxxxx). The redo saved
+     * most such runs but not all, so it is a safety net, not the fix; it has
+     * not fired with the drain (docs/8852c-quirks.md). */
+    _logger->warn("Kestrel: firmware halted during {} (attempt {}/{}, "
+                  "HALT_C2H 0x{:08x}){}",
+                  what, attempt, attempts, err,
+                  attempt < attempts ? "; redoing it from power_on" : "");
+    _brought_up = false;
+    _tx_up = false;
+    stop_wp_drain();
+  }
+  _logger->error("Kestrel: firmware halted on all {} attempt(s) of {}",
+                 attempts, what);
+  return false;
+}
+
 bool RtlKestrelDevice::BringUpMonitor(SelectedChannel channel) {
+  return BringUpCheckingFwHalt("monitor bring-up",
+                               [&] { return BringUpMonitorOnce(channel); });
+}
+
+bool RtlKestrelDevice::BringUpMonitorOnce(SelectedChannel channel) {
   struct CoexFailureGuard {
     kestrel::HalKestrel& hal;
     bool complete = false;
@@ -236,6 +293,12 @@ bool RtlKestrelDevice::BringUpMonitor(SelectedChannel channel) {
   const bool be = !_device.is_usb() && _variant == kestrel::ChipVariant::C8852B;
   if (!(be ? PowerOnFwAndTrxBe(_efuse) : PowerOnFwAndTrx(_efuse)))
     return false;
+  /* Drain the bulk-IN from here on: once intf_init has armed the USB RX
+   * path, nothing in the bring-up reads it, and the 8852C flags its RX DMA
+   * stuck (HAXI_IDCT B_AX_RXMDA_STUCK_IDCT -> DMAC_ERR_ISR HAXIDMA_ERR ->
+   * L1 0x999 -> fw assert 0x30000024) during the H2C-heavy BB/RF table load. */
+  if (_device.is_usb())
+    start_wp_drain();
   if (!_hal.phy_bb_rf_init(_efuse.rfe_type, _hal.read_cut()))
     return false;
   /* halrf RFK: DAC/ADC DC-offset calibration (vendored halrf DACK + RX-DCK)
@@ -279,6 +342,25 @@ void RtlKestrelDevice::Init(Action_ParsedRadioPacket packetProcessor,
     _logger->error("Kestrel: monitor bring-up failed");
     return;
   }
+  arm_configured_ack_responder(); /* DEVOURER_ACK_RESPONDER */
+  /* Measurement-only live disarm, started after the arm so even a zero delay
+   * cannot clear before it. The stop token bounds shutdown on a long delay. */
+  if (_ack_disarm_after_ms) {
+    const uint32_t delay_ms = *_ack_disarm_after_ms;
+    _ack_disarm_after_ms.reset();
+    _ack_disarm_thread = std::jthread([this, delay_ms](std::stop_token stop) {
+      const auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(delay_ms);
+      while (!stop.stop_requested() &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+      if (stop.stop_requested())
+        return;
+      _logger->info("DEVOURER_ACK_DISARM_AFTER_MS: disarming Kestrel ACK "
+                    "responder {} ms after completed bring-up", delay_ms);
+      ClearAckResponder();
+    });
+  }
   StartRxLoop(std::move(packetProcessor));
 }
 
@@ -290,10 +372,20 @@ void RtlKestrelDevice::InitWrite(SelectedChannel channel) {
   /* A refused bring-up is an exception here as on every other generation
    * (the IRadio contract the demos rely on): a caller that went on to
    * send_packet would otherwise learn of it one refused frame at a time. */
-  if (!BringUpMonitor(channel)) {
+  /* The firmware-halt check runs after the TX half too, so a halt anywhere
+   * in the whole bring-up redoes all of it. */
+  if (!BringUpCheckingFwHalt("TX bring-up", [&] {
+        if (!BringUpMonitorOnce(channel))
+          return false;
+        InitWriteTail(channel);
+        return true;
+      })) {
     _logger->error("Kestrel: TX bring-up failed");
     throw std::runtime_error("Kestrel TX bring-up failed (BringUpMonitor)");
   }
+}
+
+void RtlKestrelDevice::InitWriteTail(SelectedChannel channel) {
   /* TX-only: enable the CMAC port + scheduler contention queues. Kept out
    * of BringUpMonitor so the pure-monitor RX path keeps CCA on and can
    * actually hear frames.
@@ -384,6 +476,7 @@ void RtlKestrelDevice::InitWrite(SelectedChannel channel) {
    * inside every send — no drain thread. */
   if (_device.is_usb())
     start_wp_drain();
+  arm_configured_ack_responder(); /* DEVOURER_ACK_RESPONDER */
 }
 
 void RtlKestrelDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
@@ -554,6 +647,192 @@ bool RtlKestrelDevice::GetCcaGates(bool &primary_disabled,
   return true;
 }
 
+namespace {
+/* The BSSID half of the station the ACK responder registers. Nothing matches
+ * on it (A1 alone selects the response), it only has to be a unicast address
+ * distinct from the responder's own. */
+constexpr uint8_t kAckResponderBssid[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+/* BSSID CAM entry of the responder's station: 1, apart from the injection
+ * context's index 0 (peers use 0 too, and only the address entry selects the
+ * response). The macid / ADDR_CAM slot is per die: ack_slot(). */
+constexpr uint8_t kAckBssidCamIdx = 1;
+
+std::string mac_text(const uint8_t *m) {
+  char b[18];
+  std::snprintf(b, sizeof b, "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2],
+                m[3], m[4], m[5]);
+  return b;
+}
+} // namespace
+
+bool RtlKestrelDevice::SetAckResponder(const devourer::MacAddr &mac) {
+  namespace r = kestrel::reg;
+  const uint8_t *m = mac.bytes.data();
+  if (m[0] & 0x01u) {
+    _logger->error("Kestrel: ACK responder needs a UNICAST MAC (I/G set in "
+                   "{:02x}) - not armed", m[0]);
+    return false;
+  }
+  if (!_brought_up) {
+    _logger->error("Kestrel: ACK responder refused until bring-up "
+                   "(Init/InitWrite) has finished");
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(_ack_mutex);
+  uint8_t bssid[6];
+  std::memcpy(bssid, kAckResponderBssid, sizeof bssid);
+  if (std::memcmp(bssid, m, sizeof bssid) == 0)
+    bssid[5] ^= 0x02;
+  /* Clear the response-abort CCA gates: armed, the RMAC drops the SIFS ACK
+   * whenever a check reads the medium busy (measured: a co-channel neighbour
+   * AP, docs/kestrel-ack-responder.md). Saved once so a re-arm keeps the original. */
+  const uint32_t resp0 = _device.rtw_read32(r::R_AX_TRXPTCL_RESP_0);
+  if (!_ack_responder)
+    _ack_resp0_saved = resp0;
+  /* The 8852B firmware commits the station entry from H2C; the 8852C
+   * firmware ignores the addr_cam H2C, so on that die the host writes it. */
+  const bool host_cam = host_written_ack_cam();
+  const bool sent =
+      host_cam ? _hal.write_addr_cam_sta(ack_slot(), m, bssid, ack_slot(),
+                                         kAckBssidCamIdx)
+               : _hal.register_infra_sta(m, bssid, ack_slot(), ack_slot(),
+                                         kAckBssidCamIdx);
+  _device.rtw_write32(r::R_AX_TRXPTCL_RESP_0, resp0 & ~r::B_AX_RSP_CHK_ALL);
+  /* Neither the H2Cs going out nor the host write says what the RMAC will
+   * match: read the physical CAM entry back. The firmware applies its queue
+   * asynchronously, so poll for a bounded time rather than read once. The
+   * host-written entry is compared whole (the host knows every dword it
+   * wrote); the firmware-committed one by VALID + address. */
+  const auto holds = [&] {
+    return host_cam ? _hal.addr_cam_sta_holds(ack_slot(), m, bssid,
+                                              ack_slot(), kAckBssidCamIdx)
+                    : _hal.addr_cam_holds(ack_slot(), m);
+  };
+  const auto t0 = std::chrono::steady_clock::now();
+  bool committed = false;
+  int polls = 0;
+  while (sent && !(committed = holds()) &&
+         std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(100)) {
+    ++polls;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const auto waited_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - t0).count();
+  _logger->debug("Kestrel: ACK responder CAM read-back {} after {} us ({} "
+                 "re-reads)", committed ? "matched" : "did not match",
+                 waited_us, polls);
+  if (!sent || !committed) {
+    if (host_cam)
+      _logger->error("Kestrel: ACK responder for {} did not arm: the host "
+                     "write of the ADDR_CAM entry {}", mac_text(m),
+                     sent ? "does not read back" : "failed");
+    else
+      _logger->error("Kestrel: ACK responder for {} did not arm: the firmware "
+                     "{} the ADDR_CAM entry (H2C {})",
+                     mac_text(m),
+                     sent ? "accepted but did not commit" : "refused",
+                     sent ? "sent" : "failed");
+    /* Roll back. On a retarget the previous address may still be committed
+     * (a refused H2C leaves it in place), so verify it is gone too; whatever
+     * is still held stays recorded for ClearAckResponder to retry. */
+    devourer::MacAddr held[2] = {mac};
+    size_t n = 1;
+    if (_ack_responder && _ack_responder->bytes != mac.bytes)
+      held[n++] = *_ack_responder;
+    _ack_responder = disarm_ack_locked({held, n});
+    return false;
+  }
+  _ack_responder = mac;
+  _logger->info("Kestrel: hardware ACK responder armed for {} (macid {}, "
+                "ADDR_CAM entry {} {}, read back after {} us)",
+                mac_text(m), ack_slot(), ack_slot(),
+                host_cam ? "written by the host" : "committed", waited_us);
+  return true;
+}
+
+void RtlKestrelDevice::ClearAckResponder() {
+  std::lock_guard<std::mutex> lock(_ack_mutex);
+  if (!_ack_responder)
+    return;
+  const devourer::MacAddr mac = *_ack_responder;
+  /* Forgotten only once the CAM read-back confirms it; a failed clear stays
+   * armed on record so the next call retries. */
+  _ack_responder = disarm_ack_locked({&mac, 1});
+}
+
+std::optional<devourer::MacAddr>
+RtlKestrelDevice::disarm_ack_locked(std::span<const devourer::MacAddr> held) {
+  namespace r = kestrel::reg;
+  /* Disconnect the responder's station in the firmware (the 8852C never
+   * registered one: its entry is host-written and its firmware does not touch
+   * the CAM); the injection context at macid 0 is never touched. */
+  if (!host_written_ack_cam())
+    _hal.unregister_infra_sta(held.front().bytes.data(), ack_slot(),
+                              ack_slot(), kAckBssidCamIdx);
+  _device.rtw_write32(r::R_AX_TRXPTCL_RESP_0, _ack_resp0_saved);
+  /* The 8852B firmware keeps a disconnected station's entry VALID (measured:
+   * neither join_info(disconnect) + a NO_LINK addr_cam, nor a role REMOVE,
+   * nor role CREATE + NO_LINK clears it), so the host clears VALID itself, as
+   * the vendor's no-firmware mac_upd_addr_cam path writes the CAM; on the
+   * 8852C that host clear is the whole disarm. The H2Cs
+   * above land asynchronously (2-20 ms measured for the arm) and rewrite the
+   * entry, so the clear repeats until the entry has read back empty for 50 ms
+   * straight, well past that tail. The 150 ms bound only ends the wait while
+   * the entry is still held; an entry that reads empty is always given its
+   * full 50 ms, so the worst case is about 200 ms. */
+  const auto still_held = [&]() -> const devourer::MacAddr * {
+    for (const auto &a : held)
+      if (_hal.addr_cam_holds(ack_slot(), a.bytes.data()))
+        return &a;
+    return nullptr;
+  };
+  using clock = std::chrono::steady_clock;
+  const auto t0 = clock::now();
+  auto clean_since = t0;
+  const devourer::MacAddr *left = nullptr;
+  /* The address the entry last held; kept on record if the clear is not
+   * confirmed, so the next ClearAckResponder retries it. */
+  const devourer::MacAddr *last_held = &held.front();
+  bool first = true;
+  bool stable = false;
+  for (;;) {
+    if (first || left) {
+      _hal.clear_addr_cam_entry(ack_slot());
+      clean_since = clock::now();
+      first = false;
+    }
+    left = still_held();
+    if (left) {
+      last_held = left;
+      if (clock::now() - t0 >= std::chrono::milliseconds(150))
+        break;
+    } else if (clock::now() - clean_since >= std::chrono::milliseconds(50)) {
+      stable = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  /* Success only once the entry has stayed empty for the whole interval: an
+   * empty read right after a late rewrite was cleared is not a confirmation. */
+  if (!stable) {
+    _logger->warn("Kestrel: ACK responder clear did not take: ADDR_CAM entry "
+                  "{} still holds {}, the MAC may keep answering for it "
+                  "(ClearAckResponder retries)", ack_slot(),
+                  mac_text(last_held->bytes.data()));
+    return *last_held;
+  }
+  _logger->info("Kestrel: hardware ACK responder disarmed (ADDR_CAM entry {} "
+                "no longer holds {})", ack_slot(),
+                mac_text(held.front().bytes.data()));
+  return std::nullopt;
+}
+
+void RtlKestrelDevice::arm_configured_ack_responder() {
+  if (_cfg.rx.ack_responder && !SetAckResponder(*_cfg.rx.ack_responder))
+    throw std::runtime_error(
+        "Kestrel: configured ACK responder could not be armed");
+}
+
 RxEnergy RtlKestrelDevice::GetRxEnergy(bool with_nhm) {
   RxEnergy e; /* no phydm FA/CCA/IGI DIG monitor on Kestrel */
   /* DEVOURER_RX_NOISE_FLOOR — active/frame-free absolute floor via the halbb NHM
@@ -593,6 +872,17 @@ void RtlKestrelDevice::FastRetune(uint8_t channel, bool /*cache_rf*/) {
    * (band change or wide/narrow BW, where the center + BB config differ) takes
    * the full SetMonitorChannel. */
   const bool same_band = (_channel.Channel <= 14) == (channel <= 14);
+  /* 80 MHz, 5 GHz, target inside the same block: only the primary moves. */
+  if (same_band && channel > 14 && _channel.ChannelWidth == CHANNEL_WIDTH_80 &&
+      _channel.Band != 6) {
+    const auto block = [](int ch) { return ch - (((ch - 36) / 4) % 4) * 4; };
+    if (block(channel) == block(_channel.Channel)) {
+      if (channel != _channel.Channel)
+        _hal.fast_set_primary_80(channel, static_cast<uint8_t>(block(channel) + 6));
+      _channel.Channel = channel;
+      return;
+    }
+  }
   if (!same_band || _channel.ChannelWidth != CHANNEL_WIDTH_20) {
     SelectedChannel c = _channel;
     c.Channel = channel;
@@ -605,9 +895,15 @@ void RtlKestrelDevice::FastRetune(uint8_t channel, bool /*cache_rf*/) {
 
 void RtlKestrelDevice::FastSetBandwidth(ChannelWidth_t bw) {
   /* Lean path only for the 20 <-> 5/10 MHz narrowband toggle (BB small-BW
-   * field, same channel); 40/80 MHz change the center + RF bw so take the full
-   * SetMonitorChannel. */
-  if (bw != CHANNEL_WIDTH_20 && bw != CHANNEL_WIDTH_5 && bw != CHANNEL_WIDTH_10) {
+   * field, same channel), so both ends must be narrow. Leaving a 40/80/160 MHz
+   * channel moves the RF center and RF bw back to the primary and resets the
+   * MAC width (RFMOD + TX sub-carrier), none of which the lean path touches:
+   * from 149/80 it left RF18 on 155/80 and the MAC at 80 MHz. Any wide end
+   * takes the full SetMonitorChannel. */
+  const auto narrow = [](ChannelWidth_t w) {
+    return w == CHANNEL_WIDTH_20 || w == CHANNEL_WIDTH_5 || w == CHANNEL_WIDTH_10;
+  };
+  if (!narrow(bw) || !narrow(_channel.ChannelWidth)) {
     SelectedChannel c = _channel;
     c.ChannelWidth = bw;
     SetMonitorChannel(c);
@@ -996,12 +1292,29 @@ bool RtlKestrelDevice::ConfigureUlOfdma(const devourer::UlOfdmaConfig &cfg) {
   return _hal.configure_ul_ofdma(cfg);
 }
 
+bool RtlKestrelDevice::peer_slot_reserved(const char *who, uint8_t macid,
+                                          uint8_t addr_cam_idx) const {
+  if (addr_cam_idx >= kAddrCamEntries) {
+    _logger->error("Kestrel: {} refused: ADDR_CAM entry {} is past the CAM's "
+                   "last entry ({})", who, addr_cam_idx, kAddrCamEntries - 1);
+    return true;
+  }
+  if (macid != ack_slot() && addr_cam_idx != ack_slot())
+    return false;
+  _logger->error("Kestrel: {} refused: macid {} / ADDR_CAM entry {} overlaps "
+                 "the ACK responder's reserved macid {} / entry {}",
+                 who, macid, addr_cam_idx, ack_slot(), ack_slot());
+  return true;
+}
+
 bool RtlKestrelDevice::RegisterPeerSta(const uint8_t peer_mac[6], uint8_t macid,
                                        uint8_t addr_cam_idx) {
   if (!_tx_up) {
     _logger->error("Kestrel: RegisterPeerSta before InitWrite");
     return false;
   }
+  if (peer_slot_reserved("RegisterPeerSta", macid, addr_cam_idx))
+    return false;
   return _hal.register_peer_sta(peer_mac, macid, addr_cam_idx);
 }
 
@@ -1012,6 +1325,8 @@ bool RtlKestrelDevice::RegisterBeamformee(const uint8_t peer_mac[6],
     _logger->error("Kestrel: RegisterBeamformee before InitWrite");
     return false;
   }
+  if (peer_slot_reserved("RegisterBeamformee", macid, addr_cam_idx))
+    return false;
   /* The peer must exist as a fw role/ADDR_CAM entry first (same as a scheduled-
    * UL peer); then layer the CSI/bf params + hw sounding maps on top. */
   bool ok = _hal.register_peer_sta(peer_mac, macid, addr_cam_idx);
@@ -1042,14 +1357,20 @@ devourer::AdapterCaps RtlKestrelDevice::GetAdapterCaps() {
    * computed and discarded. No phydm FA/CCA/IGI monitor either. */
   c.busy_airtime_ok = false;
   c.rx_energy_ok = false;
-  /* Hardware ARQ: SetAckResponder is not implemented on the AX generation
-   * (matrix-measured 0% closure) — that flag stays false. The retry knob IS
-   * wired (WD DATA_TXCNT_LMT per frame, attempts-semantics folded to the
-   * N-retries contract in send_packet; witness-measured on the 8832CU:
-   * limits {0,2} -> modal {1,3} on-air copies exactly, limit 8 -> an 8/9
-   * near-tie consistent with ~90% witness capture of a 9-copy truth —
-   * obedient, no wedge). */
+  /* Hardware ARQ: SetAckResponder arms on both dies, verified by CAM read-back
+   * -- the 8852B through a firmware-committed INFRA station entry
+   * (HalKestrel::register_infra_sta), the 8852C through a host-written one
+   * (HalKestrel::write_addr_cam_sta), its firmware ignoring the H2C. Both dies
+   * are measured; the 8852C has answered in every measured session since the
+   * bring-up takes the TX path selection from P-MAC
+   * (kestrel_halbb_ctrl_tx_path). Any other variant does not inherit it. The retry knob IS wired
+   * (WD DATA_TXCNT_LMT per frame, attempts-semantics folded to the N-retries
+   * contract in send_packet; witness-measured on the 8832CU: limits {0,2} ->
+   * modal {1,3} on-air copies exactly, limit 8 -> an 8/9 near-tie consistent
+   * with ~90% witness capture of a 9-copy truth — obedient, no wedge). */
   c.tx_retry_limit_ok = true;
+  c.ack_responder_ok = _variant == kestrel::ChipVariant::C8852B ||
+                       _variant == kestrel::ChipVariant::C8852C;
   c.bw_mask = devourer::bw_mask_for_generation(c.generation);
   if (_variant == kestrel::ChipVariant::C8852C)
     c.bw_mask |= devourer::kBw160; /* 8852C-only (vendor bw_sup BW_CAP_160M) */

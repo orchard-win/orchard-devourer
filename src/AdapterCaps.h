@@ -191,7 +191,35 @@ struct AdapterCaps {
    * 8822B, 8812C/8822C, 8812E/8822E (the 8811A rides the 8812 die path and
    * inherits its row), 8733B (1725/1725 frames ACKed at retries_mean 0.00,
    * and retarget-proof: re-armed on a different MAC, 1728/1728 —
-   * tests/ack_txreport_matrix.sh run with the 8733B as the responder).
+   * tests/ack_txreport_matrix.sh run with the 8733B as the responder),
+   * 8852B (Kestrel has no CCX report, so the soliciting TX is an 8832CU
+   * counting the ACK frames it receives, one attempt per frame, MCS1 on
+   * ch161, 3 runs per row, responder on its own macid 127 / ADDR_CAM entry
+   * 127: 14414/14422 armed at Init, 14376/14417 armed at InitWrite,
+   * 14419/14432 retargeted, 0/6597 at the old address after the retarget,
+   * 0/6575 never armed, 0/6561 after a live disarm, re-run with the
+   * solicitor across the disarm: 3842/3848 then 0/1773; one cell in about 55
+   * across the development runs, at entry 1, read the entry back committed
+   * and answered no ACKs, not reproduced since), 8852C (the same bench with
+   * the roles swapped, the 8852B soliciting; the entry is host-written at
+   * macid / ADDR_CAM entry 63, docs/kestrel-ack-responder.md. 3 runs per row
+   * with the entry at hardware entry 126, an earlier layout that used the
+   * 8852B's CAM stride: 13831/14041 armed at Init, 14239/14408 retargeted,
+   * armed at InitWrite 98.9% and 97.0% in two runs with the third a dead
+   * session, 0/5993 at the old address, 0/6062 never armed. At hardware
+   * entry 63, the solicitor running across a live disarm in one session:
+   * 3812/3837 then 0/1616, 3846/3848 then 0/1623 (a third cell was a dead
+   * session and says nothing). Some bring-ups used to answer no ACK at all:
+   * the TX path selection the MAC attached to the ACK was uninitialised. The
+   * dead rate drifts through a day, so with times (2026-10-15, UTC-3):
+   * without the fix 6 of 15 at 10:12-10:19, 10 of 104 at 12:51-14:45 and
+   * 4 of 30 at 16:15-16:31 (plus 3 of 12 on an earlier day, time not
+   * recorded; up to ~85% on a second bench in the afternoon); with the path selection taken from the BB's
+   * P-MAC registers (docs/kestrel-ack-responder.md) 0 dead of 93 at
+   * 14:47-16:04 and 0 of 30 at 17:27-17:43, every session 96.8-100%, and 0
+   * of 20 on the second bench an hour after its ~85% series; solicitor
+   * across a live disarm 3791/3845 then 0/1602 and 3829/3843 then 0/1639,
+   * never armed 0/1591, at 17:44-17:46).
    *
    * The `on`, `retarget`, and legacy `off` rows establish arming, retargeting,
    * and a never-armed control. A backend-owned `disarmed` row supports only
@@ -216,8 +244,7 @@ struct AdapterCaps {
    * generation — the AP-mode work proved the gate where it was measured.
    * False-as-unmeasured (the
    * vht_2g4_ok reading: unmeasured, not incapable): the 8821C — it shares
-   * the recipe but no 8821CU/CE cell has run. FALSE on Kestrel:
-   * SetAckResponder is not implemented on the AX generation.
+   * the recipe but no 8821CU/CE cell has run.
    * tx_retry_limit_ok: DEVOURER_TX_RETRY_LIMIT drives hardware autonomous
    * retransmission (measured 12/0/12 A/B: 8821AU, 8812BU, 8822CU; the 8733B
    * by airtime dose-response instead, 0/3/12 -> 1.00/4.00/12.32–12.33 airings per

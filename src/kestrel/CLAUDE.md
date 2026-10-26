@@ -48,6 +48,10 @@ MAC off from any retained state, while a USB reset on running firmware drops
 the chip to ROM — a stale-handle re-enumeration that can land in the dead
 ZeroCD DISK id (`0bda:1a2b`).
 
+Bring-up drains the USB bulk-IN from `intf_init` on and checks for a halted
+firmware at its end; do not move the drain later (8852C quirk,
+`docs/8852c-quirks.md`).
+
 ## Validated capability surface
 
 On-air-validated: monitor RX (both dies, 2.4/5 GHz; the RX front-end needs
@@ -57,6 +61,17 @@ rates), channel/BW **5/10/20/40/80 MHz on both dies + 160 MHz on the 8852C**
 (the 8852B die has no 160 MHz — vendor bw_sup; caps report accordingly).
 40 MHz tunes to the block center (primary ±2); 80/160 MHz derive the center
 from the channel plan (160 = an 8-wide block, center = block_start+14).
+Every tune also programs the MAC side of the width (`mac_set_bw_txsc`, as
+rtw89 `rtw8852c_set_channel_mac`): `R_AX_WMAC_RFMOD` and the TX sub-carrier
+indices in `R_AX_TX_SUB_CARRIER_VALUE` (`rtw89_phy_get_txsc`). Without them a
+PPDU narrower than the channel — 20 MHz on an 80 MHz channel — airs at the
+block center and nothing on the primary hears it (an iPhone on ch149 never
+saw an 8852C tuned 149/80 until they were written). The wide-channel TX
+validation above injected PPDUs as wide as the channel, which do not use the
+index, so it could not catch this. On-air A/B, txdemo 6M beacons from a DUT
+tuned wide, rxdemo at 20 MHz on the primary, 500 frames a cell: before, 0 on
+every cell of both dies (8852C 149/40, 153/40, 149/80, 161/80, 36/160; 8852B
+the same minus 160); after, 400+ on every cell; a 20 MHz control 400+ both.
 `halbb_ctrl_bw_ch`'s `pri_ch` argument is the primary **channel number**, not a
 sub-band index (vendor phl passes `rtw_chan_def::chan` through unchanged): the
 vendor derives the 0x4978[11:8] sub-band index from `pri_ch` vs `central_ch`,
@@ -148,6 +163,33 @@ here (H2C 0x1D is 11ac HalMAC; rtw89 has only `SCAN_OFFLOAD` + MCC). The
 dwell-1 / N-channel data plane (`examples/dwelltx`) runs on Kestrel at ~30 ms
 slots (soak: 2000 hops, zero wrong-channel, ~97 % delivery).
 
+Both dies have one shortcut at 80 MHz on 5 GHz: a hop to another channel of
+the **same 80 MHz block** (149 <-> 161 in 149-161) moves no RF, only the
+primary. `fast_set_primary_80` rewrites what `halbb_ctrl_bw_ch_8852{b,c}`
+derives from the primary at 80 MHz — the [11:8] sub-band index (0x4978 on the
+C, 0x49c4 on the B) and the 5 MHz edge mask (`halbb_5m_mask_8852{b,c}`:
+0x4c4c/0x4d10/0x4450[24] on the C, 0x46f8/0x47b8/0x4440[31] on the B, the
+0x4 value on both; the 8852D's 0x5 is not handled) — plus the MAC TX
+sub-carrier, then resets the BB. Median hop **~2.2 ms on the 8852C** (115
+hops, max 2.5 ms) against ~213 ms for the full path, which re-runs the IQK
+this one skips; **~18 ms on the 8852B** against ~145 ms (its register
+round-trips are the slower ones, as above). Measured with an iPhone whose
+AWDL schedule alternates 149/161, on the 8852C: on the full path its 49.5 MB
+transfer spent ~44 s of 49 s deaf; on this one a 50.8 MB transfer took 7.5 s
+with nothing else changed. txdemo alternating 149/161 at 80 MHz (50 frames a
+dwell, 250 on 161) reached an rxdemo witness on 161 at 200+ on both dies,
+fast or full. With the IQK skipped, MAC retries stayed at 2-4% over the
+iPhone sessions — one adapter, one peer, near field — and the fast hop
+relies on the RF center staying put. Register parity against the full path
+(BB 0x0000-0xFFFF incl. the RF window, CMAC 0xC000-0xCFFF; pairs 149/161,
+149/153 and 157/161, 3 full tunes per primary and 12 fast hops each, on each
+die): every register the full path sets per primary matched on all 36 hops
+of each die. The rest that differed either differs between two full tunes
+of the same channel too (SW-SI counters and records, RX counters, AFE status
+outputs, the NCTL/IQK engine's status) or showed on a single hop of six
+(a few undocumented CMAC status words); a missing write would show on every
+hop. Any other wide-channel hop still takes the full path.
+
 ### Firmware IO-offload hop (`DEVOURER_KFR_OFLD`, default on)
 
 `fast_retune_ofld_8852b` ships the *entire* same-sub-band hop — the six RF18/
@@ -208,7 +250,10 @@ Almost every 8852C divergence is a **`_V1` register-bank** move
 32-byte `wd_body_t_v1` (not 24), and the RX-descriptor drv_info unit is
 16 bytes (not 8 — `FrameParserKestrel.h`; with the B's unit the C "receives"
 frames with correct lengths but unreadable bodies, i.e. looks deaf to any
-SA-matching harness). The CBV-cut die loads the `u2_nic` fw image (CAV→u1).
+SA-matching harness); the same descriptor widens the RX bandwidth field to
+dword1 [31:29] (rtw89 `AX_RXD_BW_v1_MASK`) — read with the B's [31:30],
+every width came out halved (80 MHz as 40). The CBV-cut die loads the
+`u2_nic` fw image (CAV→u1).
 Two 8852C-specific TX pieces the 8852B path lacks: the BB IFFT→TX-chain
 routing (`halbb_ctrl_tx_path_tmac_8852c`, the 0xD800..0xD82C "path-com" block
 the 8852B replaces with its per-STA CMAC antenna model), and the V1
@@ -219,7 +264,7 @@ scheduler stalled and the bulk-OUT NAKed). Behavioural quirks beyond the
 the firmware DIG biases the 5 GHz idle-noise measurement):
 `docs/8852c-quirks.md`.
 
-## 6 GHz: EDCCA parked, preamble CCA on
+## 5 and 6 GHz: EDCCA parked, preamble CCA on
 
 With the carrier-sense TX default, injection on 6 GHz stalled after the first
 frame on every 8852C in the lab (8852CU over USB, both 8852CE over PCIe):
@@ -230,20 +275,34 @@ BB's own EDCCA report (`kestrel_halbb_edcca_report`, logged at every tune as
 radio and both bands — no DIG runs here, so the energy measurement sits where
 the table's gain leaves it. The BB table's EDCCA level is 66 (-62 dBm) with
 an 8 dB hysteresis, so once anything trips it the -67 dBm floor keeps the
-gate busy; on 5 GHz the floor flickers under the -70 dBm low level and TX
-proceeds, on 6 GHz it does not. The vendor's regulatory 6 GHz threshold
-(`CBP_6G` = 53, -75 dBm) is below the floor outright.
+gate busy. On 5 GHz the same floor (-65..-69 dBm on the 8832CU) latches it
+too, and more the higher the channel: with the table level, host injection
+from an 8832CU at a 20 ms gap reached an 8812CU witness at ~50% on ch6/36/44,
+52% on ch52, 21% on ch60, 3% on ch64 and 0 of ~435 frames on ch100/149/157/
+161, with 0.0% SDR airtime on ch161 and the injector stalling on bulk-OUT
+timeouts; clearing the EDCCA gate alone restored ch64-161 to the ch6 rate,
+clearing the primary gate alone restored nothing. The vendor's regulatory
+6 GHz threshold (`CBP_6G` = 53, -75 dBm) is below the floor outright.
 
-What is programmed: at a 6 GHz tune the glue runs the vendor's EDCCA init
+What is programmed: at a 5 or 6 GHz tune the glue runs the vendor's EDCCA init
 (`halbb_cr_cfg_edcca_init` — a dm_init stage the minimal bring-up skips,
 without which the EDCCA CR table is all zeros and the writes land nowhere —
 plus `halbb_edcca_dev_hw_cap` and the hw→dev cap copy) and
 `halbb_edcca_thre_calc` in `EDCCA_NORMAL_MODE` with `is_linked = false`,
 which is the vendor's level for an unassociated device: `EDCCA_MAX`, never
-busy. Primary carrier sense (preamble detect) stays on. 2.4/5 GHz keep the
-table default the carrier-sense measurement was taken with. Consequence,
-stated plainly: this driver does not enforce the 6 GHz energy-detect level
-the FCC/ETSI LPI rules call for; the caller owns compliance, as everywhere.
+busy. Primary carrier sense (preamble detect) stays on and still defers
+(measured on ch161 after the change: a max-duty 8832CU injector under a
+co-channel MCS1 flood, gates on vs `DEVOURER_DIS_CCA=1`, numbers at the
+bring-up comment in `HalKestrel.cpp`). 2.4 GHz keeps the table default the
+carrier-sense measurement was taken with (floor -82 dBm, busy=0): the glue
+captures the table's threshold CRs before the first park and a 2.4 GHz tune
+after a parked band writes them back (measured: a fresh ch6 tune logs
+`level=66`, a 161->6->161->6 hop session logs 249 on 5 GHz and 66 again on
+each return to ch6, with the ch6 dwells witnessed). The tune log carries the
+programmed level.
+Consequence, stated plainly: this driver does not enforce the 5 GHz or 6 GHz
+energy-detect level the ETSI adaptivity and FCC/ETSI LPI rules call for; the
+caller owns compliance, as everywhere.
 
 Two things fixed on the way that affect every band: the halbb glue now gives
 the 8852C its own CR bank (`BB_AP2`, as `halbb_hw_cfg` picks from the
@@ -388,8 +447,11 @@ DELBA, whether naming the peer in the address CAM is needed at all.
 
 ## A station on a 40 MHz channel (8852C over PCIe)
 
-`set_channel` tunes the RF and the BB only. `set_station_identity` therefore
-also runs `set_channel_mac`, rtw8852c_set_channel_mac's three writes: the
+`set_channel` programs the MAC width and sub-carriers (`mac_set_bw_txsc`, from
+upstream) but not the band's rate checks, and this section's measurements
+predate it. `set_station_identity` therefore also runs `set_channel_mac`,
+rtw8852c_set_channel_mac's three writes, and `clear_station_identity` returns
+the rate checks to no link while keeping the tune's width. The writes are: the
 width in `R_AX_WMAC_RFMOD`, where a narrower frame sits in
 `R_AX_TX_SUB_CARRIER_VALUE` (`TxSubChannel.h`, rtw89_phy_get_txsc's codes),
 and the band's rate checks in `R_AX_TXRATE_CHK`. Measured on one RTL8852CE on

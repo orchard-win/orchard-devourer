@@ -63,13 +63,20 @@ void kestrel_halbb_ctrl_bw_ch(struct kestrel_halbb_ctx *ctx, unsigned char pri_c
 /* T-MAC TX path-com routing (halbb_ctrl_tx_path_tmac_8852c): the 0xD800..
  * 0xD820 path-com block (per-cut, via the MAC pwr-reg plane) + the 0x9a4 path
  * enable + both-path TSSI reset. Connects the BB IFFT output to the TX chain.
- * 8852C-only — the 8852B selects its TX antenna per-STA via the CMAC antenna
- * model, so this is a no-op there. Single-PHY, RF_PATH_A. */
+ * Then the path enable / path A-B maps from P-MAC (halbb_ctrl_tx_path_pmac_
+ * 8852c, RF_PATH_AB), so a response's path selection does not come from the
+ * MAC (see the definition). 8852C-only — the 8852B selects its TX antenna
+ * per-STA via the CMAC antenna model, so this is a no-op there. Single-PHY. */
 void kestrel_halbb_ctrl_tx_path(struct kestrel_halbb_ctx *ctx);
 /* 6 GHz EDCCA threshold after a 6 GHz tune (the vendor's unlinked
  * EDCCA_NORMAL_MODE level — see the definition); bw is the halbb
  * channel_width enum. */
-void kestrel_halbb_edcca_6g(struct kestrel_halbb_ctx *ctx, unsigned char bw);
+void kestrel_halbb_edcca_park(struct kestrel_halbb_ctx *ctx, unsigned char band_type,
+                              unsigned char bw);
+/* 2.4 GHz tune after a park: restore the table's threshold CRs. 1 = restored. */
+int kestrel_halbb_edcca_restore(struct kestrel_halbb_ctx *ctx, unsigned char bw);
+/* The EDCCA level CR as programmed. */
+unsigned int kestrel_halbb_edcca_level(struct kestrel_halbb_ctx *ctx);
 /* EDCCA hardware report: pwdB fb/p20/s20, busy flags fb/p20/s20, pwdB path 0/1. */
 void kestrel_halbb_edcca_report(struct kestrel_halbb_ctx *ctx, int out[8]);
 
