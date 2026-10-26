@@ -1,5 +1,18 @@
 # devourer
 
+> **orchard-devourer** is Orchard's fork of [OpenIPC/devourer](https://github.com/OpenIPC/devourer).
+> On top of upstream it carries two things:
+>
+> - raph559's Windows PCIe backend for the RTL8852CE, with its station identity, block-ack,
+>   aggregation and TX report work: the `winawdl/pcie-windows` branch of
+>   [raph559/devourer](https://github.com/raph559/devourer/tree/winawdl/pcie-windows), written for
+>   [winawdl](https://github.com/raph559/winawdl). Its commits keep raph559's authorship.
+> - Orchard's RTL8852BE port over PCIe, from Linux rtw89 (`src/kestrel/rtl8852be/`,
+>   `src/kestrel/CLAUDE.md`).
+>
+> The fork follows upstream by merging; it is not meant to go upstream. The rest of this
+> README is upstream's.
+
 **The Realtek Wi-Fi driver that simply devours its competitors.**
 
 Devourer is a userspace Wi-Fi driver for Realtek's 802.11n, 802.11ac and 802.11ax
